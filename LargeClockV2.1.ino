@@ -121,23 +121,15 @@ void setup() {
   strip.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
   strip.show();            // Turn OFF all pixels ASAP
   strip.clear();
-
-
-  stripSecondRow.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
-  stripSecondRow.show();            // Turn OFF all pixels ASAP
-  stripSecondRow.clear();
-
-
-  stripDate.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
-  stripDate.show();            // Turn OFF all pixels ASAP
-  stripDate.clear();
-
-
   stripDay.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
   stripDay.show();            // Turn OFF all pixels ASAP
   stripDay.clear();
-
-
+  stripSecondRow.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
+  stripSecondRow.show();            // Turn OFF all pixels ASAP
+  stripSecondRow.clear();
+  stripDate.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
+  stripDate.show();            // Turn OFF all pixels ASAP
+  stripDate.clear();
   strip.setBrightness(150);
   stripSecondRow.setBrightness(150);
   stripDay.setBrightness(150);
@@ -1132,12 +1124,12 @@ void outputDigitsTemp(int Temperature, String units) {
   int digit1;
   int Temp3;
   String TempUnits;
-//first thing we should do is turn off the dash, and we also need to turn off the day display, so the row doesn't get cluttered
+  //first thing we should do is turn off the dash, and we also need to turn off the day display, so the row doesn't get cluttered
 
   stripDate.clear();
   stripDay.clear();
 
-  
+
   bool ShowThirdDigit = false;
   if (units == "F") {
     Serial.println("CaveMan Temperature");
@@ -1204,7 +1196,7 @@ void outputDigitsTemp(int Temperature, String units) {
       pixelsDate[j] = nums[digit2][j - 26] + 26;
     }
   }
-pixelsDate[52] = 52;
+  pixelsDate[52] = 52;
   if (ShowThirdDigit) {
     for (int j = 53; j < 79; j++) {  //third date digit.  day1
       if (nums[digit3][j - 53] == -1) {
@@ -1222,11 +1214,11 @@ pixelsDate[52] = 52;
       }
     }
   }
-      for (int j = 0; j < 78; j++) {
-        pixelsDOW[j] = 23;
-      }
+  for (int j = 0; j < 78; j++) {
+    pixelsDOW[j] = 23;
+  }
 
-      
+
 
   if (units == "F") {
     for (int j = 79; j < 105; j++) {  // first digit.  a 3
@@ -1394,34 +1386,49 @@ void loop() {
       strip.setBrightness(BrightnessLevel.toInt());
       strip.show();
     } else {
+      //readings in this section are with the photoresistor facing the couch, so light exposure is limited.
+      // ok so with new photoresistor, value at 5pm is approx 490
+      //all lights off at 9pm 28-40
+      //7:30 dining room light only, curtains closed on 170-180
+      //8:15am summer curtains open, no lights on >400
       lightvalue = analogRead(pResistor);
       Serial.println(lightvalue);
-      if (lightvalue > 150) {
-        strip.setBrightness(255);
+      if (lightvalue > 450) {
+        strip.setBrightness(240);
         strip.show();
-        stripSecondRow.setBrightness(255);
+        stripSecondRow.setBrightness(240);
         stripSecondRow.show();
-        stripDay.setBrightness(255);
-        stripDate.setBrightness(255);
+        stripDay.setBrightness(125);
+        stripDate.setBrightness(125);
+        stripDay.show();
+        stripDate.show();
+      }
+      if ((lightvalue > 150) && (lightvalue < 450)) {
+        strip.setBrightness(175);
+        strip.show();
+        stripSecondRow.setBrightness(175);
+        stripSecondRow.show();
+        stripDay.setBrightness(75);
+        stripDate.setBrightness(75);
         stripDay.show();
         stripDate.show();
       }
       if ((lightvalue > 50) && (lightvalue < 150)) {
-        strip.setBrightness(150);
+        strip.setBrightness(75);
         strip.show();
-        stripSecondRow.setBrightness(150);
+        stripSecondRow.setBrightness(75);
         stripSecondRow.show();
-        stripDay.setBrightness(150);
-        stripDate.setBrightness(150);
+        stripDay.setBrightness(20);
+        stripDate.setBrightness(20);
         stripDay.show();
         stripDate.show();
       }
       if (lightvalue < 50) {
-        strip.setBrightness(20);
+        strip.setBrightness(10);
         strip.show();
-        stripSecondRow.setBrightness(20);
-        stripDay.setBrightness(20);
-        stripDate.setBrightness(20);
+        stripSecondRow.setBrightness(10);
+        stripDay.setBrightness(2);
+        stripDate.setBrightness(2);
         stripDay.show();
         stripDate.show();
         stripSecondRow.show();
@@ -2276,7 +2283,9 @@ void loop() {
 }
 
 void debugoutput (int top, int mid, int bottom, int dots, int R, int G, int B) {
-  strip.show();
+
+  strip.show();            // Turn OFF all pixels ASAP
+  strip.clear();
   if (top == 1) {
     strip.setPixelColor(11, strip.Color(R, G, B));
     strip.setPixelColor(10, strip.Color(R, G, B));
