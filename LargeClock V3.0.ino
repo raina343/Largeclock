@@ -35,8 +35,9 @@
      top row yellow       setup network running (the day/date displays also show SET UP)
      middle row green     connecting with the saved Wi-Fi details
      all three rows red   could not join the saved Wi-Fi; the setup network is started instead
-     bottom row + colon   joined the Wi-Fi
-     all rows pink        no reply from the time server
+     middle row + colon green   joined the Wi-Fi, getting the time
+     colon turns blue     got the time (shown for 2 seconds, then the time appears)
+     all rows pink        no reply from the time server (looks purple; it tries again in 5 minutes)
      all rows grey        could not look up the time server
 
    Displays are oversized 3D prints taken from
@@ -143,6 +144,24 @@ class NetLog : public Print {
   uint16_t port = 0;
   bool enabled = false;
 
+  // Lines printed before the network log starts are kept (up to EARLY_SIZE bytes) and sent once it does,
+  // so start-up messages (charger, RTC, button...) reach the log server too.
+  void sendEarlyLines() {
+    if (!enabled) return;
+    size_t start = 0;
+    for (size_t i = 0; i < earlyLen; i++) {
+      if (early[i] != '\n') continue;
+      sendText(early + start, i - start, true);
+      start = i + 1;
+    }
+    if (earlyLost) {
+      const char *note = "(some earlier start-up lines didn't fit in memory and were only shown in the Serial Monitor)";
+      sendText(note, strlen(note), true);
+    }
+    earlyLen = 0;
+    earlyLost = false;
+  }
+
   size_t write(uint8_t c) override {
     Serial.write(c);
     if (c == '\r') return 1;
@@ -154,16 +173,33 @@ class NetLog : public Print {
   using Print::write;
 
  private:
+  static const size_t EARLY_SIZE = 3072;
   char line[160];
   size_t len = 0;
+  char early[EARLY_SIZE];
+  size_t earlyLen = 0;
+  bool earlyLost = false;
+
+  void sendText(const char *text, size_t n, bool fromStartup) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    logUdp.beginPacket(host, port);
+    logUdp.write((const uint8_t *)"[" CLOCK_HOSTNAME "] ", strlen("[" CLOCK_HOSTNAME "] "));   // which clock it came from
+    if (fromStartup) logUdp.write((const uint8_t *)"(start-up) ", 11);
+    logUdp.write((const uint8_t *)text, n);
+    logUdp.write('\n');
+    logUdp.endPacket();
+  }
 
   void sendLine() {
-    if (enabled && len > 0 && WiFi.status() == WL_CONNECTED) {
-      logUdp.beginPacket(host, port);
-      logUdp.write((const uint8_t *)"[" CLOCK_HOSTNAME "] ", strlen("[" CLOCK_HOSTNAME "] "));   // which clock it came from
-      logUdp.write((const uint8_t *)line, len);
-      logUdp.write('\n');
-      logUdp.endPacket();
+    if (len == 0) return;
+    if (enabled) {
+      sendText(line, len, false);
+    } else if (earlyLen + len + 1 <= EARLY_SIZE) {       // not sending yet: keep it for later
+      memcpy(early + earlyLen, line, len);
+      earlyLen += len;
+      early[earlyLen++] = '\n';
+    } else {
+      earlyLost = true;
     }
     len = 0;
   }
@@ -1516,7 +1552,7 @@ void applyBrightness() {
 bool timeValid = false;      // false until the RTC or the time server has given a believable time
 uint32_t ntpRetryAt = 0;     // UTC seconds; 0 = no retry pending (next sync is the daily one at noon)
 
-void sendNTPpacket(IPAddress &address) {
+bool sendNTPpacket(IPAddress &address) {
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
   packetBuffer[0] = 0b11100011;   // LI, Version, Mode
   packetBuffer[1] = 0;            // Stratum, or type of clock
@@ -1527,9 +1563,9 @@ void sendNTPpacket(IPAddress &address) {
   packetBuffer[13] = 0x4E;
   packetBuffer[14] = 49;
   packetBuffer[15] = 52;
-  Udp.beginPacket(address, 123);  // NTP requests are to port 123
+  if (!Udp.beginPacket(address, 123)) return false;   // NTP requests are to port 123
   Udp.write(packetBuffer, NTP_PACKET_SIZE);
-  Udp.endPacket();
+  return Udp.endPacket() == 1;
 }
 
 // ---- Time server (NTP) ----
@@ -1587,9 +1623,17 @@ int ntpQuery(const char *host) {
     Log.println(host);
     return 1;
   }
-  Udp.begin(localPort);
+  if (!Udp.begin(localPort)) {
+    Log.println("NTP: the Wi-Fi module wouldn't open a network socket (all in use?)");
+    return 2;
+  }
   unsigned long sent = millis();
-  sendNTPpacket(ntpAddr);
+  if (!sendNTPpacket(ntpAddr)) {
+    Udp.stop();
+    Log.print("NTP: the Wi-Fi module wouldn't send the request to ");
+    Log.println(host);
+    return 2;
+  }
   int result = 2;
   while (millis() - sent < 2000) {
     if (Udp.parsePacket() >= NTP_PACKET_SIZE) {
@@ -1676,7 +1720,18 @@ void applyNtpTime(uint32_t rtcBefore, const char *host) {
 }
 
 // Returns 0 = clock set, 1 = couldn't look up any server, 2 = no usable reply (the DS3231 keeps its own time).
+// mDNS is paused while the time servers are asked: with mDNS's socket open, the Wi-Fi module never passes the
+// time server replies on (seen on the clock: no replies with it open, replies straight away with it closed).
+// The pause lasts only as long as the sync (a few seconds); .local lookups work again straight after.
 int syncTimeFromNTP() {
+  bool hadMdns = mdnsIsRunning();
+  if (hadMdns) pauseMdns();
+  int r = syncTimeOnce();
+  if (hadMdns) resumeMdns();
+  return r;
+}
+
+int syncTimeOnce() {
   Log.println("NTP: syncing the time");
   syncRejected = 0;
   int dnsFails = 0;
@@ -2097,6 +2152,13 @@ void debugoutput(int top, int mid, int bottom, int dots, int R, int G, int B) {
   }
 }
 
+// Colours just the colon dots on the top time display, keeping whatever status is already showing.
+void statusDots(int R, int G, int B) {
+  Panel &P = panels[TIME_A_PANEL];
+  for (int i = 0; i < P.numSep; i++) P.strip->setPixelColor(P.sepLed[i], R, G, B);
+  P.strip->show();
+}
+
 void printWiFiStatus() {
   Log.print("SSID: ");
   Log.println(WiFi.SSID());
@@ -2138,6 +2200,7 @@ void startNetLog() {
   Log.port = owner.logPort;
   logUdp.begin(4211);
   Log.enabled = true;
+  Log.sendEarlyLines();
   Log.print("Network log: sending to ");
   Log.print(ip);
   Log.print(":");
@@ -3170,7 +3233,7 @@ void updateMessage() {
 // ================= HOME ASSISTANT (MQTT) =================
 // With a broker set on the setup page, the clock connects to it and announces itself using Home Assistant's
 // MQTT discovery, so it shows up under Settings > Devices & services > MQTT as "Rainbow Clock" with:
-//   Effect (Rotate or one effect), Current effect, Effect change, Message, Message seconds, Brightness,
+//   Effect (Rotate or one effect), "In rotation: <effect>" switches, Current effect, Effect change, Message, Message seconds, Brightness,
 //   Auto dimming, Temperature, Wi-Fi signal, Restart, and online/offline status.
 // Changes made from Home Assistant last until the clock restarts (the setup page's settings apply at
 // start-up), so automations can change things often without wearing out the settings flash.
@@ -3190,6 +3253,8 @@ bool mqttAnnounce = false;           // (re)send discovery + all states on the n
 int pubStyle = -2;
 int pubAuto = -1;
 int pubInterval = -1;
+uint32_t pubMask = 0;
+bool pubMaskSent = false;
 int pubBright = -1;
 int pubDimming = -1;
 int pubMsgSecs = -1;
@@ -3235,6 +3300,13 @@ void mqttSendDiscovery() {
   mqttDiscover("select", "effect",
                "\"name\":\"Effect\",\"icon\":\"mdi:palette\",\"cmd_t\":\"~/effect/set\",\"stat_t\":\"~/effect\",\"ops\":" +
                jsonList("Rotate", STYLE_NAMES, NUM_STYLES));
+  for (int i = 0; i < NUM_STYLES; i++) {             // "In rotation: <effect>" switches, under Configuration
+    char obj[8];
+    snprintf(obj, sizeof(obj), "fx%02d", i + 1);
+    mqttDiscover("switch", obj,
+                 String("\"name\":\"In rotation: ") + STYLE_NAMES[i] + "\",\"icon\":\"mdi:playlist-check\",\"ent_cat\":\"config\"," +
+                 "\"cmd_t\":\"~/" + obj + "/set\",\"stat_t\":\"~/" + obj + "\"");
+  }
   mqttDiscover("sensor", "current_effect",
                "\"name\":\"Current effect\",\"icon\":\"mdi:palette-outline\",\"stat_t\":\"~/current_effect\"");
   mqttDiscover("select", "interval",
@@ -3283,6 +3355,18 @@ void mqttSendStates(bool force) {
     mqttPublish(mqttBase + "/current_effect", STYLE_NAMES[currentStyle], true);
     pubStyle = currentStyle;
     pubAuto = autoStyle;
+  }
+  if (force || !pubMaskSent || owner.fxMask != pubMask) {
+    for (int i = 0; i < NUM_STYLES; i++) {
+      uint32_t bit = 1UL << i;
+      if (force || !pubMaskSent || ((owner.fxMask ^ pubMask) & bit)) {
+        char t[8];
+        snprintf(t, sizeof(t), "/fx%02d", i + 1);
+        mqttPublish(mqttBase + t, (owner.fxMask & bit) ? "ON" : "OFF", true);
+      }
+    }
+    pubMask = owner.fxMask;
+    pubMaskSent = true;
   }
   if (force || owner.fxInterval != pubInterval) {
     mqttPublish(mqttBase + "/interval", FX_PERIOD_NAMES[owner.fxInterval], true);
@@ -3371,6 +3455,18 @@ void onMqttMessage(int size) {
       if (i >= 0) {
         autoStyle = false;
         setStyle(i);
+      }
+    }
+  } else if (what.length() == 4 && what.startsWith("fx")) {   // fx01..fx31: tick/untick an effect in the rotation
+    int i = what.substring(2).toInt() - 1;
+    if (i >= 0 && i < NUM_STYLES) {
+      uint32_t bit = 1UL << i;
+      uint32_t mask = !strcasecmp(val, "ON") ? (owner.fxMask | bit) : (owner.fxMask & ~bit);
+      if (mask & allEffectsMask()) {
+        owner.fxMask = mask;
+        if (autoStyle && rtcOk && timeValid) updateEffect(tzMain.toLocal(rtc.now().unixtime()));
+      } else {
+        Log.println("Home Assistant: at least one effect has to stay in the rotation");
       }
     }
   } else if (what == "interval") {
@@ -3542,6 +3638,19 @@ void startMdns() {
   }
 }
 
+bool mdnsIsRunning() {
+  return mdnsRunning;
+}
+
+void pauseMdns() {       // closes mDNS's network socket; resumeMdns() opens it again
+  mdnsUdp.stop();
+  mdnsRunning = false;
+}
+
+void resumeMdns() {
+  startMdns();
+}
+
 void restartMdns() {     // after rejoining the Wi-Fi (the IP address may have changed)
   mdnsUdp.stop();
   startMdns();
@@ -3575,6 +3684,7 @@ void applySavedEffect() {
 bool unsavedChanges() {
   return currentFixedEffect() != savedSettings.fxFixed ||
          owner.fxInterval != savedSettings.fxInterval ||
+         owner.fxMask != savedSettings.fxMask ||
          strcmp(owner.brightness, savedSettings.brightness) != 0 ||
          strcmp(owner.dimmer, savedSettings.dimmer) != 0 ||
          owner.msgSeconds != savedSettings.msgSeconds;
@@ -3676,13 +3786,36 @@ void logChargerStatus() {
 }
 
 // Once a minute: if charging has been switched back on (e.g. the chip reset itself), switch it off again.
+// Also watches the rest of the chip: any change in its settings, status or faults is logged, so whatever
+// makes the CHG LED flash again (a fault, an input-power dip, the chip resetting itself) shows in the log.
 void checkChargerStillOff() {
+  static int last1 = -1, last5 = -1, last8 = -1;
+  int r1 = pmicRead(0x01), r5 = pmicRead(0x05), r8 = pmicRead(0x08);
+  int latched = pmicRead(0x09);                  // faults since the last read (reading clears them)
+  if (r1 < 0 || r5 < 0 || r8 < 0 || latched < 0) return;
+  bool changed = last1 >= 0 && (r1 != last1 || r5 != last5 || (r8 & 0xF4) != (last8 & 0xF4));
+  if (latched) {
+    Log.print("Battery charger: a fault happened in the last minute (REG09=0x");
+    Log.print(latched, HEX);
+    Log.print(":");
+    if (latched & 0x80) Log.print(" watchdog expired");
+    if ((latched & 0x30) == 0x10) Log.print(" input fault - the 5 V supply dipped too low or went too high");
+    if ((latched & 0x30) == 0x20) Log.print(" thermal shutdown");
+    if ((latched & 0x30) == 0x30) Log.print(" safety timer expired");
+    if (latched & 0x40) Log.print(" boost (OTG) fault");
+    if (latched & 0x08) Log.print(" battery over-voltage");
+    if (latched & 0x07) { Log.print(" temperature sensor fault "); Log.print(latched & 0x07); }
+    Log.println(")");
+  }
+  if (changed) Log.println("Battery charger: its registers have changed:");
+  if (changed || latched) logChargerStatus();
+  last1 = r1; last5 = r5; last8 = r8;
 #if DISABLE_BATTERY_CHARGER
-  int r1 = pmicRead(0x01);
-  if (r1 >= 0 && (r1 & 0x30) != 0) {
-    Log.println("Battery charger: charging had come back on - switching it off again");
+  if ((r1 & 0x30) != 0 || (r5 & 0x38) != 0) {
+    Log.println("Battery charger: charging/watchdog/timer had come back on - switching them off again");
     chargerOff();
     logChargerStatus();
+    last1 = pmicRead(0x01); last5 = pmicRead(0x05);
   }
 #endif
 }
@@ -3693,6 +3826,31 @@ void checkChargerStillOff() {
 // settings are kept. While it's held, the date display shows "CLR" and the day display counts down; let go
 // before the end and nothing changes. A button that already reads pressed at start-up is ignored until it has
 // been released once, so a stuck button or wiring fault can never cause a clear-and-restart loop.
+// How the chip currently has a pin set up, to find out if something has changed it.
+void logPinSetup(int pin) {
+  EPortType port = g_APinDescription[pin].ulPort;
+  uint32_t bit = g_APinDescription[pin].ulPin;
+  uint8_t cfg = PORT->Group[port].PINCFG[bit].reg;
+  bool output = PORT->Group[port].DIR.reg & (1ul << bit);
+  bool outHigh = PORT->Group[port].OUT.reg & (1ul << bit);
+  bool inHigh = PORT->Group[port].IN.reg & (1ul << bit);
+  Log.print("Pin ");
+  Log.print(pin);
+  Log.print(" (port ");
+  Log.print(port == PORTA ? "A" : "B");
+  Log.print(bit);
+  Log.print("): ");
+  Log.print(output ? "OUTPUT driven " : "input");
+  if (output) Log.print(outHigh ? "HIGH" : "LOW");
+  if (!output) {
+    Log.print((cfg & PORT_PINCFG_PULLEN) ? (outHigh ? ", pull-up on" : ", pull-DOWN on") : ", NO pull-up");
+    Log.print((cfg & PORT_PINCFG_INEN) ? "" : ", input buffer off");
+  }
+  Log.print((cfg & PORT_PINCFG_PMUXEN) ? ", TAKEN OVER by a peripheral (e.g. a serial port)" : "");
+  Log.print(", reads ");
+  Log.println(inHigh ? "HIGH" : "LOW");
+}
+
 void checkResetButton() {
   static unsigned long pressedAt = 0;
   static int shownLeft = -1;
@@ -3707,6 +3865,7 @@ void checkResetButton() {
       Log.print("Reset button: pin ");
       Log.print(RESET_BUTTON_PIN);
       Log.println(" reads PRESSED at start-up - ignoring it until it's released (check the button wiring)");
+      logPinSetup(RESET_BUTTON_PIN);
     }
     return;
   }
@@ -3792,6 +3951,7 @@ void setup() {
   Log.print("Reset button (pin ");
   Log.print(RESET_BUTTON_PIN);
   Log.println(digitalRead(RESET_BUTTON_PIN) == HIGH ? "): not pressed" : "): reads PRESSED");
+  logPinSetup(RESET_BUTTON_PIN);
   buildSinTable();
   Log.println("Starting LED displays...");
   setupAllPanels();
@@ -3850,7 +4010,7 @@ void setup() {
       startSetupAP();
       if (rtcOk) nextWifiTry = rtc.now().unixtime() + WIFI_RETRY_MINUTES * 60UL;   // try the saved Wi-Fi again later
     } else {
-      debugoutput(0, 0, 1, 1, 0, 150, 0);     // bottom row + colon green: joined the Wi-Fi
+      statusDots(0, 150, 0);                  // colon green too: joined the Wi-Fi, getting the time
       WiFi.noLowPowerMode();                  // keep the radio awake so it answers promptly
       server.begin();
       startNetLog();
@@ -3858,12 +4018,13 @@ void setup() {
       printWiFiStatus();
       if (rtcOk) {
         ntpResult = syncTimeFromNTP();
+        if (ntpResult == 0) { statusDots(0, 0, 255); delay(2000); }                     // colon blue: got the time
         if (ntpResult == 1) { debugoutput(1, 1, 1, 0, 150, 150, 150); delay(3000); }   // grey: DNS failed
         if (ntpResult == 2) { debugoutput(1, 1, 1, 0, 255, 75, 250);  delay(3000); }   // pink: no reply
       }
     }
   }
-  if (rtcOk && ntpResult != 0) ntpRetryAt = rtc.now().unixtime() + 3600UL;   // boot sync failed: retry hourly
+  if (rtcOk && ntpResult != 0) ntpRetryAt = rtc.now().unixtime() + 300UL;    // boot sync failed: retry in 5 minutes, then hourly
 
   if (!timeValid) {   // no believable time yet: dashes until the time server answers
     writePanelText(panels[TIME_A_PANEL], "----");
