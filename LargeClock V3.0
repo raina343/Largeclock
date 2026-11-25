@@ -1,0 +1,3887 @@
+/*
+   Dual Timezone RGB LED Clock
+   by Raina
+
+   Board: Arduino MKR WiFi 1010 with a DS3231 real-time clock.
+
+   What it does
+   - Two time displays (top and bottom row), each in its own timezone, plus a date and a day-of-week display.
+   - Time comes from an NTP server over Wi-Fi (NTP code originally from Michael Margolis and Tom Igoe) and is
+     kept by the DS3231 between syncs, so the clock keeps running if Wi-Fi drops.
+   - The DS3231's alarms (INT pin on pin 0) say when to change the displays: every minute at :00 for the
+     time, date and effect, and at :55 for the temperature.
+   - Every day at 12:00 (top-row time) the clock checks its Wi-Fi connection, rejoins if the router has
+     restarted (retrying hourly until it's back), then re-syncs the time.
+   - Each timezone is a UTC offset plus a daylight saving rule, chosen on the setup page. No reflash needed if
+     daylight saving is abolished or made permanent.
+   - 31 colour effects (30 from the LedClock sketch, plus the original clock's rainbow).
+     The setup page picks which effects are used and how often
+     the clock moves to the next one: every minute, hour, 12 hours or 24 hours.
+   - Optional temperature on the date display at :55 each minute, from the DS3231 or a DS18B20 probe (chosen
+     on the setup page, with an offset to correct a sensor that reads a little high or low).
+   - Auto-dimming from a light sensor on A0.
+   - Home Assistant: with an MQTT broker set on the setup page, the clock appears in Home Assistant by itself
+     (MQTT discovery): pick the effect, show a message on the date/day displays, brightness, temperature...
+     Changes from Home Assistant are temporary (memory only) until its "Save settings" button is pressed.
+   - Everything printed to the Serial Monitor can also be sent to another computer on the network (setup page
+     "Network log"): UDP text messages, one per line.
+
+   First start: the clock opens a Wi-Fi network called "RainbowClockSetup". Join it and browse to
+   http://192.168.4.1 to enter your Wi-Fi details and settings. After a reflash the settings start blank again.
+
+   Start-up status colours on the top time display:
+     top row red          Wi-Fi module not found
+     top row pink         could not start the setup network
+     top row yellow       setup network running (the day/date displays also show SET UP)
+     middle row green     connecting with the saved Wi-Fi details
+     all three rows red   could not join the saved Wi-Fi; the setup network is started instead
+     bottom row + colon   joined the Wi-Fi
+     all rows pink        no reply from the time server
+     all rows grey        could not look up the time server
+
+   Displays are oversized 3D prints taken from
+   https://nerdiy.de/en/howto-elektronik-sieben-segment-ziffer-pxldigit-aus-ws2812-leds-bauen/
+
+   Reset-settings button (pin 14 to GND): hold for 3 seconds to clear the saved Wi-Fi network and password
+   and restart into the setup network. Other settings are kept.
+
+   Network name: the clock calls itself CLOCK_HOSTNAME ("RainbowWallClock") on the Wi-Fi, so it's easy to spot
+   in the router's device list, and the setup page can be opened at http://rainbowwallclock.local
+
+   Serial Monitor (115200 baud): type help for test commands (pick an effect, show test text, and so on).
+
+   GPL License applies etc etc etc
+*/
+
+#include <SPI.h>
+#include <WiFiNINA.h>
+#include <WiFiUdp.h>
+#include <FlashStorage.h>
+#include <Timezone.h>
+#include <Adafruit_NeoPixel.h>
+#include "RTClib.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduinoMqttClient.h>
+#include <ArduinoMDNS.h>
+
+// ================= PINS (all of them, in one place) =================
+// LED data lines (WS2812B)
+#define PIN_TIME_A        10      // top time display (main timezone)
+#define PIN_TIME_B        1       // bottom time display (second timezone)
+#define PIN_DATE          2       // date display
+#define PIN_DAY           13      // day-of-week display
+// DS3231 real-time clock: SDA = 11, SCL = 12 (the board's fixed I2C pins, nothing to set here)
+#define CLOCK_INTERRUPT_PIN 0     // DS3231 INT/SQW (open drain, active low): minute and :55 alarms
+// Sensors
+#define LIGHT_SENSOR_PIN  A0      // light sensor for auto-dimming
+#define DS18B20_PIN       8       // DS18B20 data wire (needs a 4.7k pull-up to 3.3V); -1 = no probe fitted
+// Buttons and wiring
+#define RESET_BUTTON_PIN  14      // reset-settings button, wired between this pin and GND
+#define RESET_WIRE_PIN    7       // wired straight to the board's RESET line: never drive this pin
+
+#if DS18B20_PIN == RESET_WIRE_PIN
+#error "DS18B20_PIN can't be the pin wired to RESET: the probe's signalling would restart the board"
+#endif
+#if DS18B20_PIN == RESET_BUTTON_PIN
+#error "DS18B20_PIN can't be the reset button's pin"
+#endif
+
+// ---------------- Display hardware ----------------
+#define ROTATED_TIME_A    true    // mounted upside down
+#define ROTATED_TIME_B    false
+#define ROTATED_DATE      false
+#define ROTATED_DAY       false
+
+// ---------------- Effect fine-tuning ----------------
+#define BLINK_COLON       false   // true = time colon blinks once a second, false = always on
+#define HOUR_SHOW         true    // rainbow + sparkle on the hour
+#define FADE_MS           400     // how long a changing segment takes to fade
+#define TRANS_SIDE_BY_SIDE false   // Trans style: false = stripes top to bottom, true = left to right
+#define TRANS_GRADIENT     true    // Trans style: true = colours blend smoothly, false = solid stripes
+#define FLIP_FIRE_TIME_A  true    // Fire + Matrix rain: true = flip up/down on that display
+#define FLIP_FIRE_TIME_B  false
+#define FLIP_FIRE_DATE    true
+#define FLIP_FIRE_DAY     true
+#define SPIN_MS           3000    // Spinning rainbow: ms per full turn
+#define SPIN_OFFSET       0       // Spinning rainbow: 0 = all characters in step, try 40 to stagger them
+#define GHOST             0       // brightness of unlit segments: 0 = off, try 10
+#define FPS               50
+#define DATE_DAY_PERCENT  50      // with auto-dimming off, date and day displays run at this % of the slider
+
+Adafruit_NeoPixel stripTimeA(86,  PIN_TIME_A, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel stripTimeB(86,  PIN_TIME_B, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel stripDate (105, PIN_DATE,   NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel stripDay  (78,  PIN_DAY,    NEO_GRB + NEO_KHZ800);
+
+// ---------------- Other hardware / network ----------------
+#define CLOCK_HOSTNAME    "RainbowWallClock"  // this clock's name: given to the router, used for http://rainbowwallclock.local,
+                                              // as the Home Assistant device name and at the start of each network log
+                                              // line. Give each clock its own name. Letters, digits and - only.
+#define DISABLE_BATTERY_CHARGER true      // no LiPo fitted: turn the battery charger off, which stops the CHG LED flashing
+const int pResistor = LIGHT_SENSOR_PIN;
+#define RESET_HOLD_MS     3000            // hold the reset-settings button this long to clear the saved Wi-Fi details
+RTC_DS3231 rtc;
+unsigned int localPort = 2390;            // local port to listen for NTP replies
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+WiFiUDP Udp;
+char ssid[] = "RainbowClockSetup";        // name of the setup network the clock creates
+int status = WL_IDLE_STATUS;
+WiFiServer server(80);
+String readString;
+
+// ---------------- Log: Serial Monitor, plus an optional copy to another computer ----------------
+// Everything the sketch prints goes through Log (Log.print / Log.println work like Serial's). It always
+// goes to the Serial Monitor. When "Network log" is set on the setup page, each finished line is also sent
+// as one UDP message to that computer, e.g. to see it there run:  nc -kul 4210   (or use Packet Sender).
+WiFiUDP logUdp;
+
+class NetLog : public Print {
+ public:
+  IPAddress host;
+  uint16_t port = 0;
+  bool enabled = false;
+
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    if (c == '\r') return 1;
+    if (c == '\n') { sendLine(); return 1; }
+    if (len >= sizeof(line)) sendLine();       // very long line: send it in pieces
+    line[len++] = (char)c;
+    return 1;
+  }
+  using Print::write;
+
+ private:
+  char line[160];
+  size_t len = 0;
+
+  void sendLine() {
+    if (enabled && len > 0 && WiFi.status() == WL_CONNECTED) {
+      logUdp.beginPacket(host, port);
+      logUdp.write((const uint8_t *)"[" CLOCK_HOSTNAME "] ", strlen("[" CLOCK_HOSTNAME "] "));   // which clock it came from
+      logUdp.write((const uint8_t *)line, len);
+      logUdp.write('\n');
+      logUdp.endPacket();
+    }
+    len = 0;
+  }
+};
+NetLog Log;
+
+// ================= TYPES =================
+// All types live here, above the first function, because the Arduino IDE
+// inserts function prototypes just before the first function in the file.
+
+struct RGB { uint8_t r, g, b; };
+const RGB BLACK = {0, 0, 0};
+
+// A segment as a line inside a character box 1 wide x 2 tall (y = 0 at top)
+struct Line { float x0, y0, x1, y1; };
+
+// ---- 7-segment ----
+enum { S7_TOP, S7_TL, S7_BL, S7_BOT, S7_BR, S7_MID, S7_TR };
+// Each line runs from the segment's FIRST wired LED to its last (board upright).
+// Measured on the pin 10 display (upside down) and turned back upright.
+const Line LINES7[7] = {
+  {1, 0, 0, 0},   // top           right to left
+  {0, 0, 0, 1},   // top-left      top to bottom
+  {0, 1, 0, 2},   // bottom-left   top to bottom
+  {0, 2, 1, 2},   // bottom        left to right
+  {1, 2, 1, 1},   // bottom-right  bottom to top
+  {1, 1, 0, 1},   // middle        right to left
+  {1, 1, 1, 0}    // top-right     bottom to top
+};
+const uint8_t ROT7[7] = {S7_BOT, S7_BR, S7_TR, S7_TOP, S7_TL, S7_MID, S7_BL};
+
+#define M7_TOP (1 << S7_TOP)
+#define M7_TL  (1 << S7_TL)
+#define M7_BL  (1 << S7_BL)
+#define M7_BOT (1 << S7_BOT)
+#define M7_BR  (1 << S7_BR)
+#define M7_MID (1 << S7_MID)
+#define M7_TR  (1 << S7_TR)
+
+const uint16_t DIGIT7[10] = {
+  M7_TOP | M7_TL | M7_BL | M7_BOT | M7_BR | M7_TR,           // 0
+  M7_TR | M7_BR,                                             // 1
+  M7_TOP | M7_TR | M7_MID | M7_BL | M7_BOT,                  // 2
+  M7_TOP | M7_TR | M7_MID | M7_BR | M7_BOT,                  // 3
+  M7_TL | M7_TR | M7_MID | M7_BR,                            // 4
+  M7_TOP | M7_TL | M7_MID | M7_BR | M7_BOT,                  // 5
+  M7_TOP | M7_TL | M7_BL | M7_BOT | M7_BR | M7_MID,          // 6
+  M7_TOP | M7_TR | M7_BR,                                    // 7
+  0x7F,                                                      // 8
+  M7_TOP | M7_TL | M7_TR | M7_MID | M7_BR | M7_BOT           // 9
+};
+
+// ---- 13-segment ----
+enum { S_K, S_L, S_M, S_E, S_H, S_I, S_J, S_G, S_F, S_A, S_B, S_C, S_D };
+// Each line runs from the segment's FIRST wired LED to its second.
+// Measured order: K2 K1, L1 L2, M2 M1, E2 E1, H1 H2, I2 I1, J1 J2,
+//                 G2 G1, F2 F1, A1 A2, B1 B2, C1 C2, D2 D1
+// (1 = top end, or left end for A, G and D)
+const Line LINES13[13] = {
+  {1, 2, 0.5, 1},     // K diagonal bottom right  (bottom end first)
+  {0.5, 1, 0.5, 2},   // L centre bottom          (top first)
+  {0, 2, 0.5, 1},     // M diagonal bottom left   (bottom end first)
+  {0, 2, 0, 1},       // E bottom left            (bottom first)
+  {0, 0, 0.5, 1},     // H diagonal top left      (top end first)
+  {0.5, 1, 0.5, 0},   // I centre top             (bottom first)
+  {1, 0, 0.5, 1},     // J diagonal top right     (top end first)
+  {1, 1, 0, 1},       // G middle                 (right first)
+  {0, 1, 0, 0},       // F top left               (bottom first)
+  {0, 0, 1, 0},       // A top                    (left first)
+  {1, 0, 1, 1},       // B top right              (top first)
+  {1, 1, 1, 2},       // C bottom right           (top first)
+  {1, 2, 0, 2}        // D bottom                 (right first)
+};
+// 180 degree rotation: A<->D, B<->E, C<->F, H<->K, I<->L, J<->M, G stays
+const uint8_t ROT13[13] = {S_H, S_I, S_J, S_B, S_K, S_L, S_M, S_G, S_C, S_D, S_E, S_F, S_A};
+
+#define SA (1 << S_A)
+#define SB (1 << S_B)
+#define SC (1 << S_C)
+#define SD (1 << S_D)
+#define SE (1 << S_E)
+#define SF (1 << S_F)
+#define SG (1 << S_G)
+#define SH (1 << S_H)
+#define SI (1 << S_I)
+#define SJ (1 << S_J)
+#define SK (1 << S_K)
+#define SL (1 << S_L)
+#define SM (1 << S_M)
+// The middle bar (G) is two LEDs. A character can light just one of them:
+#define SGL (1 << 13)   // left LED of the middle bar only
+#define SGR (1 << 14)   // right LED of the middle bar only
+
+const char *DAY_NAMES[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+
+// ---- One strip of characters ----
+const int MAX_LEDS  = 105;
+const int MAX_CHARS = 4;
+
+struct Panel {
+  Adafruit_NeoPixel *strip;
+  int numLeds;
+  bool rotated;
+  int numChars;
+  int charStart[MAX_CHARS];   // first LED of each character, in wiring order
+  int segsPerChar, ledsPerSeg;
+  const uint8_t *rotSeg;
+  int sepLed[2], numSep;      // colon / dot LEDs
+  bool blinkSep;
+
+  // what to show, one segment mask per character, left to right as seen
+  uint16_t target[MAX_CHARS];
+  bool hasContent;
+
+  // fade between old and new characters
+  uint16_t fromMask[MAX_CHARS], toMask[MAX_CHARS];
+  unsigned long fadeStart[MAX_CHARS];
+  bool started;
+
+  // per physical LED
+  uint8_t xs[MAX_LEDS], ys[MAX_LEDS];   // position as the viewer sees it, 0-255
+  int8_t  slot[MAX_LEDS];               // left-to-right slot (chars and separator)
+  uint8_t ang[MAX_LEDS];                // angle around its character's centre, 0-255
+  uint8_t rad[MAX_LEDS];                // distance from its character's centre, 0-255
+  uint8_t gang[MAX_LEDS];               // angle around the middle of the whole display, 0-255
+  int     numSlots;
+  uint8_t level[MAX_LEDS];              // 0 = not part of the text, 255 = fully lit
+  RGB     fx[MAX_LEDS], out[MAX_LEDS];
+
+  // effect memory
+  uint8_t heat[MAX_LEDS], glint[MAX_LEDS], jOffset[MAX_LEDS], jSpeed[MAX_LEDS];
+  bool styleInit;
+  bool hourShowActive;
+  bool manual;                          // showing a value typed in the Serial Monitor
+  bool flipFire;                        // Fire and Matrix rain upside down on this panel
+  uint16_t fadeMs;                      // 0 = FADE_MS; shorter while a message scrolls
+  bool hideSep;                         // turn the colon / dot off (date dot while showing temperature)
+  uint8_t brightness;                   // set by updateBrightness()
+  int16_t dropY[16];                    // Matrix rain drops
+  uint8_t dropSpd[16];
+  int8_t  burstSlot;                    // Fireworks
+  uint8_t burstHue;
+  unsigned long burstStart;
+  unsigned long hourShowStart;
+};
+
+const int NUM_PANELS = 4;
+enum { TIME_A_PANEL, TIME_B_PANEL, DATE_PANEL, DAY_PANEL };
+Panel panels[NUM_PANELS];
+
+
+// ---------------- Saved settings ----------------
+typedef struct {
+  boolean valid;
+  char wifissid[100];
+  char Password[100];
+  char brightness[5];
+  char temp[3];
+  char twelvehr[3];
+  int16_t tz1Offset;     // top row: standard-time offset from UTC, in minutes (e.g. -480 for Pacific)
+  uint8_t tz1Dst;        // top row: index into DST_RULES
+  int16_t tz2Offset;     // bottom row: standard-time offset from UTC, in minutes
+  uint8_t tz2Dst;        // bottom row: index into DST_RULES
+  char USDateFormat[3];
+  char tempUnits[3];
+  char dimmer[3];
+  uint32_t fxMask;       // bit n set = effect n+1 is in the rotation
+  uint8_t fxInterval;    // how often the effect changes: index into FX_PERIODS
+  uint8_t tempSensor;    // 0 = DS3231, 1 = DS18B20
+  int16_t tempOffset10;  // added to the shown temperature, in tenths of a degree of the chosen units
+  char logHost[40];      // network log: IP address or name of the computer to send to ("" = off)
+  uint16_t logPort;      // network log: UDP port on that computer
+  char mqttHost[40];     // MQTT broker for Home Assistant: IP address or name ("" = off)
+  uint16_t mqttPort;     // MQTT broker port (1883)
+  char mqttUser[32];     // MQTT username (on Home Assistant OS: a Home Assistant user)
+  char mqttPass[48];     // MQTT password
+  int8_t fxFixed;        // -1 = rotate through the ticked effects; 0-29 = always show that one effect
+  uint16_t msgSeconds;   // how long a message stays up (set from Home Assistant)
+  uint32_t settingsMagic;  // equals SETTINGS_MAGIC once the fields above hold real values
+} Credentials;
+
+FlashStorage(my_flash_store, Credentials);
+Credentials owner;
+
+// Settings in a ready-to-use form (filled in by loadSettings)
+bool twelveHourMode = false;
+bool dateDayFirst   = false;
+bool showTemp       = false;
+bool tempInF        = false;
+bool autoDimming    = true;
+bool inSetupMode    = false;   // the clock is running its own "RainbowClockSetup" network
+
+// Declared early because the Serial Monitor commands use it.
+bool rtcOk = false;
+
+/*
+   ---------------------------------------------------------------------------
+   TIMEZONES
+   ---------------------------------------------------------------------------
+   Each of the two rows is described by two settings, both chosen on the setup page
+   and saved to flash:
+     1. its STANDARD-time offset from UTC, in minutes
+     2. which daylight saving rule it follows (an index into DST_RULES)
+
+   So if a region drops the clock change, nothing needs reflashing:
+     - abolishes DST, stays on standard time -> set "Daylight saving" to None
+     - adopts permanent DST ("Sunshine Protection Act" style) -> set it to Permanent
+     - moves its change dates -> edit or add a line in DST_RULES and reflash
+
+   Timezone.h note: the hour of a rule is local time *before* the change, so the
+   DST start hour is in standard time and the DST end hour is in daylight time.
+*/
+enum DstMode : uint8_t {
+  DST_NONE = 0,        // standard time all year
+  DST_PERMANENT,       // daylight time all year (standard offset + 1h)
+  DST_US,
+  DST_EU,
+  DST_AU,
+  DST_NZ,
+};
+
+struct DstRuleSet {
+  const char *label;
+  int8_t startWeek, startDow, startMonth, startHour;   // when DST begins
+  int8_t endWeek,   endDow,   endMonth,   endHour;     // when DST ends
+  bool utcBased;   // true = hours above are UTC (EU changes at 01:00 UTC everywhere)
+};
+
+// Order must match the DstMode enum above.  Labels are what the setup page shows.
+//   US / Canada:  2nd Sun Mar 02:00  ->  1st Sun Nov 02:00
+//   EU / UK:      last Sun Mar 01:00 UTC  ->  last Sun Oct 01:00 UTC
+//   Australia:    1st Sun Oct 02:00  ->  1st Sun Apr 03:00
+//   New Zealand:  last Sun Sep 02:00  ->  1st Sun Apr 03:00  To add a rule, add an enum entry and a line here.
+const DstRuleSet DST_RULES[] = {
+  {"None",                     0,      0,   0,   0,    0,     0,   0,   0,  false},
+  {"Permanent (+1h all year)", 0,      0,   0,   0,    0,     0,   0,   0,  false},
+  {"US / Canada",              Second, Sun, Mar, 2,    First, Sun, Nov, 2,  false},
+  {"EU / UK",                  Last,   Sun, Mar, 1,    Last,  Sun, Oct, 1,  true},
+  {"Australia",                First,  Sun, Oct, 2,    First, Sun, Apr, 3,  false},
+  {"New Zealand",              Last,   Sun, Sep, 2,    First, Sun, Apr, 3,  false},
+};
+const uint8_t DST_RULE_COUNT = sizeof(DST_RULES) / sizeof(DST_RULES[0]);
+
+// Every real-world standard offset, in minutes.  Used to build the offset dropdown.
+const int16_t UTC_OFFSETS[] = {
+  -720, -660, -600, -570, -540, -480, -420, -360, -300, -240, -210, -180, -120, -60,
+  0, 60, 120, 180, 210, 240, 270, 300, 330, 345, 360, 390, 420, 480, 525, 540, 570,
+  600, 630, 660, 720, 765, 780, 840
+};
+const uint8_t UTC_OFFSET_COUNT = sizeof(UTC_OFFSETS) / sizeof(UTC_OFFSETS[0]);
+
+TimeChangeRule utcRule = {"UTC", Last, Sun, Mar, 1, 0};
+Timezone tzMain(utcRule);     // top row, date, day of week and effect timing
+Timezone tzSecond(utcRule);   // second row
+
+// Convert an hour in UTC into the local hour for a given offset (used by UTC-based rules like the EU's).
+int8_t utcHourToLocal(int8_t utcHour, int offsetMin) {
+  int m = ((int)utcHour * 60 + offsetMin) % 1440;
+  if (m < 0) m += 1440;
+  return m / 60;
+}
+
+void applyZone(Timezone &tz, int16_t offsetMin, uint8_t dstMode) {
+  if (dstMode >= DST_RULE_COUNT) dstMode = DST_NONE;
+
+  if (dstMode == DST_NONE) {
+    TimeChangeRule std = {"STD", Last, Sun, Mar, 1, offsetMin};
+    tz.setRules(std, std);   // identical rules = no clock change
+    return;
+  }
+  if (dstMode == DST_PERMANENT) {
+    TimeChangeRule dst = {"DST", Last, Sun, Mar, 1, offsetMin + 60};
+    tz.setRules(dst, dst);
+    return;
+  }
+
+  const DstRuleSet &r = DST_RULES[dstMode];
+  int8_t startHour = r.startHour;
+  int8_t endHour = r.endHour;
+  if (r.utcBased) {
+    startHour = utcHourToLocal(r.startHour, offsetMin);       // standard local time
+    endHour = utcHourToLocal(r.endHour, offsetMin + 60);      // daylight local time
+  }
+  TimeChangeRule dst = {"DST", r.startWeek, r.startDow, r.startMonth, startHour, offsetMin + 60};
+  TimeChangeRule std = {"STD", r.endWeek, r.endDow, r.endMonth, endHour, offsetMin};
+  tz.setRules(dst, std);
+}
+
+bool validOffset(int16_t m) {
+  return m >= -720 && m <= 840;
+}
+
+// Checks the saved zone settings and loads the rules into the two Timezone objects (called by loadSettings).
+void loadTimezoneSettings() {
+  if (!validOffset(owner.tz1Offset)) owner.tz1Offset = 0;
+  if (!validOffset(owner.tz2Offset)) owner.tz2Offset = 0;
+  if (owner.tz1Dst >= DST_RULE_COUNT) owner.tz1Dst = DST_NONE;
+  if (owner.tz2Dst >= DST_RULE_COUNT) owner.tz2Dst = DST_NONE;
+
+  applyZone(tzMain, owner.tz1Offset, owner.tz1Dst);
+  applyZone(tzSecond, owner.tz2Offset, owner.tz2Dst);
+
+  Log.print("Main zone: UTC offset ");
+  Log.print(owner.tz1Offset);
+  Log.print(" min, DST: ");
+  Log.println(DST_RULES[owner.tz1Dst].label);
+  Log.print("Second zone: UTC offset ");
+  Log.print(owner.tz2Offset);
+  Log.print(" min, DST: ");
+  Log.println(DST_RULES[owner.tz2Dst].label);
+}
+
+// Write an offset in minutes as "UTC-8", "UTC+5:30", "UTC+0".
+void printOffsetLabel(WiFiClient &client, int16_t m) {
+  client.print("UTC");
+  client.print(m < 0 ? "-" : "+");
+  int a = abs(m);
+  client.print(a / 60);
+  if (a % 60) {
+    client.print(":");
+    if (a % 60 < 10) client.print("0");
+    client.print(a % 60);
+  }
+}
+
+// Setup-page card for one clock row: its UTC offset and its daylight saving rule.
+void printZoneFields(WiFiClient &client, int n, const char *title, const char *note, int16_t offset, uint8_t dst) {
+  client.print("<li class='a-tz"); client.print(n); client.println("'><fieldset class='card'>");
+  client.print("<legend>"); client.print(title); client.println("</legend>");
+  client.print("<p class='hint'>Pick the <b>standard (winter)</b> offset, e.g. Pacific is UTC-8. Daylight saving adds the hour. ");
+  client.print(note); client.println("</p>");
+
+  client.print("<label for='tz"); client.print(n); client.println("off'>UTC offset</label>");
+  client.print("<div class='select'><select id='tz"); client.print(n); client.print("off'>");
+  bool found = false;
+  for (uint8_t i = 0; i < UTC_OFFSET_COUNT; i++) {
+    if (UTC_OFFSETS[i] == offset) found = true;
+  }
+  if (!found) {   // keep an unusual saved value selectable rather than silently changing it
+    client.print("<option value='"); client.print(offset); client.print("' selected='selected'>");
+    printOffsetLabel(client, offset); client.print("</option>");
+  }
+  for (uint8_t i = 0; i < UTC_OFFSET_COUNT; i++) {
+    client.print("<option value='"); client.print(UTC_OFFSETS[i]); client.print("'");
+    if (UTC_OFFSETS[i] == offset) client.print(" selected='selected'");
+    client.print(">"); printOffsetLabel(client, UTC_OFFSETS[i]); client.print("</option>");
+  }
+  client.println("</select><span class='focus'></span></div>");
+
+  client.print("<label for='tz"); client.print(n); client.println("dst'>Daylight saving</label>");
+  client.print("<div class='select'><select id='tz"); client.print(n); client.print("dst'>");
+  for (uint8_t i = 0; i < DST_RULE_COUNT; i++) {
+    client.print("<option value='"); client.print(i); client.print("'");
+    if (i == dst) client.print(" selected='selected'");
+    client.print(">"); client.print(DST_RULES[i].label); client.print("</option>");
+  }
+  client.println("</select><span class='focus'></span></div>");
+  client.println("</fieldset></li>");
+}
+
+// ---------------- Colour helpers ----------------
+RGB rgb(uint8_t r, uint8_t g, uint8_t b) { RGB c = {r, g, b}; return c; }
+
+RGB hsv(uint8_t h, uint8_t s = 255, uint8_t v = 255) {
+  uint32_t c = Adafruit_NeoPixel::ColorHSV((uint16_t)h << 8, s, v);
+  return rgb((uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);
+}
+
+uint8_t qadd(uint8_t a, uint8_t b) { int s = a + b; return s > 255 ? 255 : s; }
+RGB addRGB(RGB a, RGB b) { return rgb(qadd(a.r, b.r), qadd(a.g, b.g), qadd(a.b, b.b)); }
+RGB scaleRGB(RGB c, uint8_t v) { return rgb(c.r * v / 255, c.g * v / 255, c.b * v / 255); }
+
+// Smooth wave: input 0-255 = one full cycle, output 0-255 (table, so it's fast)
+uint8_t SIN8[256];
+void buildSinTable() {
+  for (int i = 0; i < 256; i++) SIN8[i] = (uint8_t)(127.5 + 127.5 * sin(i * TWO_PI / 256.0));
+}
+uint8_t wave8(long x) { return SIN8[x & 0xFF]; }
+
+bool every(unsigned long &last, unsigned long ms) {
+  if (millis() - last >= ms) { last = millis(); return true; }
+  return false;
+}
+
+// ---------------- 13-segment font ----------------
+uint16_t charMask13(char c) {
+  switch (toupper(c)) {
+    case '0': return SA | SB | SC | SD | SE | SF | SJ | SM;
+    case '1': return SB | SC;
+    case '2': return SA | SB | SG | SE | SD;
+    case '3': return SA | SB | SG | SC | SD;
+    case '4': return SF | SG | SB | SC;
+    case '5': return SA | SF | SG | SC | SD;
+    case '6': return SA | SF | SG | SE | SC | SD;
+    case '7': return SA | SB | SC;
+    case '8': return SA | SB | SC | SD | SE | SF | SG;
+    case '9': return SA | SB | SC | SD | SF | SG;
+    case 'A': return SA | SB | SC | SE | SF | SG;
+    case 'B': return SA | SB | SC | SD | SGR | SI | SL;     // half bar: doesn't stick out left of the centre stroke
+    case 'C': return SA | SD | SE | SF;
+    case 'D': return SA | SB | SC | SD | SI | SL;
+    case 'E': return SA | SD | SE | SF | SG;
+    case 'F': return SA | SE | SF | SG;
+    case 'G': return SA | SC | SD | SE | SF;
+    case 'H': return SB | SC | SE | SF | SG;
+    case 'I': return SA | SD | SI | SL;
+    case 'J': return SB | SC | SD | SE;
+    case 'K': return SE | SF | SGL | SJ | SK;               // half bar: doesn't stick out right of the diagonals
+    case 'L': return SD | SE | SF;
+    case 'M': return SB | SC | SE | SF | SH | SJ;
+    case 'N': return SB | SC | SE | SF | SH | SK;
+    case 'O': return SA | SB | SC | SD | SE | SF;
+    case 'P': return SA | SB | SE | SF | SG;
+    case 'Q': return SA | SB | SC | SD | SE | SF | SK;
+    case 'R': return SA | SB | SE | SF | SG | SK;
+    case 'S': return SA | SF | SG | SC | SD;
+    case 'T': return SA | SI | SL;
+    case 'U': return SB | SC | SD | SE | SF;
+    case 'V': return SE | SF | SM | SJ;
+    case 'W': return SB | SC | SE | SF | SK | SM;
+    case 'X': return SH | SJ | SK | SM;
+    case 'Y': return SH | SJ | SL;
+    case 'Z': return SA | SJ | SM | SD;
+    case '-': return SG;
+    case '/': return SJ | SM;
+    case '*': return SG | SH | SI | SJ | SK | SL | SM;
+    default:  return 0;
+  }
+}
+
+// ---------------- 7-segment font (time displays) ----------------
+uint16_t charMask7(char c) {
+  if (c >= '0' && c <= '9') return DIGIT7[c - '0'];
+  switch (toupper(c)) {
+    case 'A': return M7_TOP | M7_TL | M7_TR | M7_MID | M7_BL | M7_BR;
+    case 'B': return M7_TL | M7_BL | M7_BOT | M7_BR | M7_MID;           // b
+    case 'C': return M7_TOP | M7_TL | M7_BL | M7_BOT;
+    case 'D': return M7_TR | M7_BR | M7_BOT | M7_BL | M7_MID;           // d
+    case 'E': return M7_TOP | M7_TL | M7_MID | M7_BL | M7_BOT;
+    case 'F': return M7_TOP | M7_TL | M7_MID | M7_BL;
+    case 'G': return M7_TOP | M7_TL | M7_BL | M7_BOT | M7_BR;
+    case 'H': return M7_TL | M7_TR | M7_MID | M7_BL | M7_BR;
+    case 'I': return M7_TL | M7_BL;
+    case 'J': return M7_TR | M7_BR | M7_BOT | M7_BL;
+    case 'L': return M7_TL | M7_BL | M7_BOT;
+    case 'N': return M7_BL | M7_MID | M7_BR;                            // n
+    case 'O': return M7_BL | M7_BOT | M7_BR | M7_MID;                   // o
+    case 'P': return M7_TOP | M7_TL | M7_TR | M7_MID | M7_BL;
+    case 'R': return M7_BL | M7_MID;                                    // r
+    case 'S': return DIGIT7[5];
+    case 'T': return M7_TL | M7_BL | M7_BOT | M7_MID;                   // t
+    case 'U': return M7_TL | M7_BL | M7_BOT | M7_BR | M7_TR;
+    case 'Y': return M7_TL | M7_TR | M7_MID | M7_BR | M7_BOT;
+    case '-': return M7_MID;
+    case '_': return M7_BOT;
+    default:  return 0;
+  }
+}
+
+// ---------------- Panel setup ----------------
+// Physical LED for a character / segment as the VIEWER sees it
+int physLed(Panel &P, int c, int s, int k) {
+  if (P.rotated) {
+    c = P.numChars - 1 - c;
+    s = P.rotSeg[s];
+    k = P.ledsPerSeg - 1 - k;
+  }
+  return P.charStart[c] + s * P.ledsPerSeg + k;
+}
+
+// charX: left edge of each character (in wiring order, unrotated)
+// sepAfter: separator sits after this character (-1 = none), sepY: y of each separator LED
+void setupPanel(Panel &P, Adafruit_NeoPixel *strip, int numLeds, bool rotated,
+                int numChars, const int *starts, const float *charX,
+                int segsPerChar, int ledsPerSeg, const Line *lines, const uint8_t *rotSeg,
+                const int *seps, int numSep, int sepAfter, float sepX, const float *sepY,
+                bool blinkSep) {
+  memset(&P, 0, sizeof(Panel));
+  P.strip = strip;
+  P.numLeds = numLeds;
+  P.rotated = rotated;
+  P.numChars = numChars;
+  P.segsPerChar = segsPerChar;
+  P.ledsPerSeg = ledsPerSeg;
+  P.rotSeg = rotSeg;
+  P.numSep = numSep;
+  P.blinkSep = blinkSep;
+  P.styleInit = true;
+  P.numSlots = numChars + (numSep > 0 ? 1 : 0);
+  for (int c = 0; c < numChars; c++) P.charStart[c] = starts[c];
+  for (int i = 0; i < numSep; i++) P.sepLed[i] = seps[i];
+
+  float totalW = charX[numChars - 1] + 1.0f;
+  for (int c = 0; c < numChars; c++) {
+    int slotNum = (sepAfter >= 0 && c > sepAfter) ? c + 1 : c;
+    for (int s = 0; s < segsPerChar; s++)
+      for (int k = 0; k < ledsPerSeg; k++) {
+        const Line &L = lines[s];
+        float t = (k + 0.5f) / ledsPerSeg;
+        int i = starts[c] + s * ledsPerSeg + k;
+        P.xs[i] = (charX[c] + L.x0 + (L.x1 - L.x0) * t) / totalW * 255.0f;
+        P.ys[i] = (L.y0 + (L.y1 - L.y0) * t) / 2.0f * 255.0f;
+        P.slot[i] = slotNum;
+        // angle around the centre of this character (0-255 = 0-360 degrees)
+        float lx = L.x0 + (L.x1 - L.x0) * t - 0.5f;
+        float ly = L.y0 + (L.y1 - L.y0) * t - 1.0f;
+        P.ang[i] = (uint8_t)((int)(atan2(ly, lx) / TWO_PI * 256.0f + 256.0f) & 0xFF);
+        float r = sqrt(lx * lx + ly * ly) / 1.12f * 255.0f;
+        P.rad[i] = r > 255 ? 255 : (uint8_t)r;
+      }
+  }
+  for (int i = 0; i < numSep; i++) {
+    P.xs[seps[i]] = sepX / totalW * 255.0f;
+    P.ys[seps[i]] = sepY[i] / 2.0f * 255.0f;
+    P.slot[seps[i]] = sepAfter + 1;
+    P.ang[seps[i]] = (sepY[i] < 1.0f) ? 192 : 64;   // above centre = up, below = down
+    P.rad[seps[i]] = (uint8_t)(fabs(sepY[i] - 1.0f) / 1.12f * 255.0f);
+  }
+  if (rotated)
+    for (int i = 0; i < numLeds; i++) {
+      P.xs[i] = 255 - P.xs[i];
+      P.ys[i] = 255 - P.ys[i];
+      P.slot[i] = P.numSlots - 1 - P.slot[i];
+      P.ang[i] += 128;                               // turned 180 degrees
+    }
+  // angle around the middle of the whole display, as the viewer sees it
+  for (int i = 0; i < numLeds; i++) {
+    float gx = (P.xs[i] - 127.5f) / 255.0f * totalW;
+    float gy = (P.ys[i] - 127.5f) / 255.0f * 2.0f;
+    P.gang[i] = (uint8_t)((int)(atan2(gy, gx) / TWO_PI * 256.0f + 256.0f) & 0xFF);
+  }
+
+  strip->begin();
+  strip->clear();
+  strip->show();
+}
+
+void setupAllPanels() {
+  static const int   TIME_STARTS[4] = {0, 21, 44, 65};
+  static const float TIME_X[4]      = {0.0, 1.6, 3.8, 5.4};
+  static const int   TIME_SEPS[2]   = {42, 43};
+  static const float TIME_SEP_Y[2]  = {0.6, 1.4};
+
+  static const int   DATE_STARTS[4] = {0, 26, 53, 79};
+  static const float DATE_X[4]      = {0.0, 1.6, 3.8, 5.4};
+  static const int   DATE_SEPS[1]   = {52};
+  static const float DATE_SEP_Y[1]  = {2.0};
+
+  static const int   DAY_STARTS[3]  = {0, 26, 52};
+  static const float DAY_X[3]       = {0.0, 1.6, 3.2};
+
+  setupPanel(panels[TIME_A_PANEL], &stripTimeA, 86, ROTATED_TIME_A, 4, TIME_STARTS, TIME_X,
+             7, 3, LINES7, ROT7, TIME_SEPS, 2, 1, 3.2, TIME_SEP_Y, BLINK_COLON);
+  setupPanel(panels[TIME_B_PANEL], &stripTimeB, 86, ROTATED_TIME_B, 4, TIME_STARTS, TIME_X,
+             7, 3, LINES7, ROT7, TIME_SEPS, 2, 1, 3.2, TIME_SEP_Y, BLINK_COLON);
+  setupPanel(panels[DATE_PANEL], &stripDate, 105, ROTATED_DATE, 4, DATE_STARTS, DATE_X,
+             13, 2, LINES13, ROT13, DATE_SEPS, 1, 1, 3.2, DATE_SEP_Y, false);
+  setupPanel(panels[DAY_PANEL], &stripDay, 78, ROTATED_DAY, 3, DAY_STARTS, DAY_X,
+             13, 2, LINES13, ROT13, NULL, 0, -1, 0, NULL, false);
+
+  panels[TIME_A_PANEL].flipFire = FLIP_FIRE_TIME_A;
+  panels[TIME_B_PANEL].flipFire = FLIP_FIRE_TIME_B;
+  panels[DATE_PANEL].flipFire   = FLIP_FIRE_DATE;
+  panels[DAY_PANEL].flipFire    = FLIP_FIRE_DAY;
+  for (int p = 0; p < NUM_PANELS; p++) panels[p].brightness = 80;
+}
+
+// ---------------- Colour styles ----------------
+// Each style fills P.fx[] for the whole panel; only the lit segments show it.
+uint8_t gHue = 0;
+
+// 1. Rainbow flowing across
+void styleRainbow(Panel &P) {
+  uint8_t t = millis() / 10;
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = hsv(t - P.xs[i]);
+}
+
+// 2. Plasma
+void stylePlasma(Panel &P) {
+  long t = (millis() / 6) % 6144;
+  for (int i = 0; i < P.numLeds; i++) {
+    int v = wave8(P.xs[i] * 2 + t) + wave8(P.ys[i] + t / 2) + wave8(P.xs[i] + P.ys[i] - t / 3);
+    P.fx[i] = hsv((uint8_t)(v / 3 + t / 8));
+  }
+}
+
+// 3. Fire: flickering, hotter at the bottom of each character
+RGB heatColor(uint8_t h) {
+  if (h < 85)  return rgb(h * 3, 0, 0);
+  if (h < 170) return rgb(255, (h - 85) * 3, 0);
+  return rgb(255, 255, (h - 170) * 3);
+}
+void styleFire(Panel &P) {
+  if (P.styleInit) memset(P.heat, 150, sizeof(P.heat));
+  for (int i = 0; i < P.numLeds; i++) {
+    int y = P.flipFire ? 255 - P.ys[i] : P.ys[i];   // 255 = hottest end
+    int target = random(70 + y / 3, 120 + y);
+    if (target > 230) target = 230;
+    P.heat[i] = (P.heat[i] * 3 + target) / 4;
+    P.fx[i] = heatColor(P.heat[i]);
+  }
+}
+
+// 4. Scanner: steady colour with a bright band sweeping across
+void styleScanner(Panel &P) {
+  uint8_t pos = wave8((millis() % 60000UL) * 15UL * 256UL / 60000UL);
+  for (int i = 0; i < P.numLeds; i++) {
+    P.fx[i] = hsv(gHue, 255, 110);
+    int dist = abs((int)P.xs[i] - (int)pos);
+    if (dist < 40) P.fx[i] = addRGB(P.fx[i], hsv(gHue + 128, 120, 255 - dist * 6));
+  }
+}
+
+// 5. Each character its own colour, slowly rotating
+void styleDigitColours(Panel &P) {
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = hsv(gHue + P.slot[i] * 50);
+}
+
+// 6. Breathing: one colour gently pulsing
+void styleBreathe(Panel &P) {
+  uint8_t v = 90 + wave8(millis() / 12) * 165 / 255;
+  RGB c = hsv(gHue / 2, 230, v);
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = c;
+}
+
+// 7. Sparkle: warm colour with white glints
+void styleSparkle(Panel &P) {
+  if (P.styleInit) memset(P.glint, 0, sizeof(P.glint));
+  if (random(100) < 35) P.glint[random(P.numLeds)] = 255;
+  for (int i = 0; i < P.numLeds; i++) {
+    P.glint[i] = P.glint[i] * 7 / 8;
+    P.fx[i] = addRGB(hsv(gHue, 220, 170), rgb(P.glint[i], P.glint[i], P.glint[i]));
+  }
+}
+
+// 8. Sunset: vertical colour gradient
+void styleSunset(Panel &P) {
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = hsv(gHue + P.ys[i] / 3);
+}
+
+// 9. Colour cycle: everything fades through the rainbow together
+void styleCycle(Panel &P) {
+  RGB c = hsv(gHue);
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = c;
+}
+
+// 10. Jewels: every LED drifts through colours at its own speed
+void styleJewels(Panel &P) {
+  if (P.styleInit)
+    for (int i = 0; i < P.numLeds; i++) { P.jOffset[i] = random(256); P.jSpeed[i] = random(5, 40); }
+  unsigned long t = millis();
+  for (int i = 0; i < P.numLeds; i++)
+    P.fx[i] = hsv(P.jOffset[i] + (uint8_t)((t * P.jSpeed[i] / 1000) & 0xFF));
+}
+
+// 11. Trans: blue, pink, white, pink, blue
+//     Stacked top to bottom (top / upper / middle / lower / bottom rows),
+//     or side by side across the characters when TRANS_SIDE_BY_SIDE is true.
+const RGB TRANS_BLUE  = {30, 150, 255};
+const RGB TRANS_PINK  = {255, 70, 140};
+const RGB TRANS_WHITE = {220, 220, 220};
+
+// Smooth blend through blue, pink, white, pink, blue as pos goes 0 -> 255
+RGB transGradient(uint8_t pos) {
+  const RGB stops[5] = {TRANS_BLUE, TRANS_PINK, TRANS_WHITE, TRANS_PINK, TRANS_BLUE};
+  int seg = pos / 64;                          // which pair of colours: 0-3
+  int from = seg * 64;
+  int span = (seg == 3) ? 63 : 64;
+  uint8_t amt = (pos - from) * 255 / span;
+  RGB a = stops[seg], b = stops[seg + 1];
+  return rgb((a.r * (255 - amt) + b.r * amt) / 255,
+             (a.g * (255 - amt) + b.g * amt) / 255,
+             (a.b * (255 - amt) + b.b * amt) / 255);
+}
+
+void styleTrans(Panel &P) {
+  for (int i = 0; i < P.numLeds; i++) {
+    if (TRANS_GRADIENT) {
+      P.fx[i] = transGradient(TRANS_SIDE_BY_SIDE ? P.xs[i] : P.ys[i]);
+      continue;
+    }
+    int band;
+    if (TRANS_SIDE_BY_SIDE) {
+      int n = P.numSlots - 1;
+      band = n > 0 ? (P.slot[i] * 4 + n / 2) / n : 2;
+    } else {
+      uint8_t y = P.ys[i];
+      band = (y < 10) ? 0 : (y < 116) ? 1 : (y < 138) ? 2 : (y < 245) ? 3 : 4;
+    }
+    P.fx[i] = (band == 2) ? TRANS_WHITE : (band == 1 || band == 3) ? TRANS_PINK : TRANS_BLUE;
+  }
+}
+
+// 12. Spinning rainbow: every character has its own colour wheel turning 360 degrees
+void styleSpin(Panel &P) {
+  uint8_t t = (millis() * 256UL / SPIN_MS) & 0xFF;   // one full turn every SPIN_MS
+  for (int i = 0; i < P.numLeds; i++)
+    P.fx[i] = hsv(P.ang[i] - t + P.slot[i] * SPIN_OFFSET);
+}
+
+// ---------------- Styles 13-30 ----------------
+RGB blendRGB(RGB a, RGB b, uint8_t amt) {   // amt 0 = all a, 255 = all b
+  return rgb((a.r * (255 - amt) + b.r * amt) / 255,
+             (a.g * (255 - amt) + b.g * amt) / 255,
+             (a.b * (255 - amt) + b.b * amt) / 255);
+}
+
+// 13. Ocean: rolling blue-green waves with white caps
+void styleOcean(Panel &P) {
+  long t = millis() / 12;
+  for (int i = 0; i < P.numLeds; i++) {
+    uint8_t v = 110 + wave8(P.xs[i] * 2 + t + wave8(P.ys[i] + t / 3) / 4) * 145 / 255;
+    uint8_t h = 128 + wave8(P.xs[i] - t / 2) / 6;
+    P.fx[i] = hsv(h, v > 240 ? 90 : 255, v);
+  }
+}
+
+// 14. Aurora: green, blue and purple curtains drifting
+void styleAurora(Panel &P) {
+  long t = millis() / 20;
+  for (int i = 0; i < P.numLeds; i++) {
+    uint8_t w = wave8(P.xs[i] * 3 + wave8(P.ys[i] / 2 + t) / 2 - t);
+    P.fx[i] = hsv(80 + w * 110 / 255, 230, 120 + wave8(P.xs[i] + t * 2) * 135 / 255);
+  }
+}
+
+// 15. Comet: a bright comet with a tail orbits inside every character
+void styleComet(Panel &P) {
+  uint8_t head = (millis() * 256UL / 1500) & 0xFF;
+  for (int i = 0; i < P.numLeds; i++) {
+    uint8_t d = head - P.ang[i];                       // how far behind the head
+    uint8_t v = d < 128 ? 255 - d : 90;
+    P.fx[i] = hsv(gHue + d / 4, d < 10 ? 120 : 255, v);
+  }
+}
+
+// 16. Matrix rain: green drops falling down each column
+void styleMatrix(Panel &P) {
+  const int COLS = 16;
+  if (P.styleInit)
+    for (int c = 0; c < COLS; c++) { P.dropY[c] = random(-200, 255); P.dropSpd[c] = random(3, 9); }
+  for (int c = 0; c < COLS; c++) {
+    P.dropY[c] += P.dropSpd[c];
+    if (P.dropY[c] > 400) { P.dropY[c] = -random(0, 200); P.dropSpd[c] = random(3, 9); }
+  }
+  for (int i = 0; i < P.numLeds; i++) {
+    int y = P.flipFire ? 255 - P.ys[i] : P.ys[i];
+    int d = P.dropY[P.xs[i] * COLS / 256] - y;          // > 0 = above the drop's head
+    if (d >= 0 && d < 15)        P.fx[i] = rgb(180, 255, 180);
+    else if (d >= 15 && d < 120) P.fx[i] = hsv(96, 255, 255 - (d - 15) * 150 / 105);
+    else                         P.fx[i] = hsv(96, 255, 95);
+  }
+}
+
+// 17. Colour wipe: a new colour sweeps across, left to right, again and again
+void styleWipe(Panel &P) {
+  const unsigned long WIPE = 2500;
+  unsigned long n = millis() / WIPE;
+  int prog = (millis() % WIPE) * 320 / WIPE - 32;
+  uint8_t hNew = n * 71, hOld = (n - 1) * 71;
+  for (int i = 0; i < P.numLeds; i++) {
+    int d = P.xs[i] - prog;
+    P.fx[i] = d < -12 ? hsv(hNew) : d > 12 ? hsv(hOld) : hsv(hNew, 80, 255);
+  }
+}
+
+// 18. Lava lamp: slow warm blobs of magenta, red and orange
+void styleLava(Panel &P) {
+  long t = millis() / 25;
+  for (int i = 0; i < P.numLeds; i++) {
+    int v = (wave8(P.xs[i] + t) + wave8(P.ys[i] * 2 - t * 3 / 2) + wave8(P.xs[i] / 2 + P.ys[i] + t / 2)) / 3;
+    P.fx[i] = hsv(235 + v / 4, 255, 150 + v * 105 / 255);
+  }
+}
+
+// 19. Candy stripes: diagonal two-colour stripes sliding along
+void styleCandy(Panel &P) {
+  uint8_t t = millis() / 12;
+  for (int i = 0; i < P.numLeds; i++) {
+    uint8_t s = P.xs[i] + P.ys[i] / 2 - t;
+    P.fx[i] = (s & 32) ? hsv(gHue) : hsv(gHue + 128, 120, 255);
+  }
+}
+
+// 20. Heartbeat: red double pulse, like a heart
+void styleHeartbeat(Panel &P) {
+  unsigned long t = millis() % 1200;
+  int b1 = t < 150 ? 255 - t * 255 / 150 : 0;
+  int b2 = (t >= 250 && t < 450) ? (255 - (t - 250) * 255 / 200) * 3 / 4 : 0;
+  RGB c = hsv(248, 230, 110 + max(b1, b2) * 145 / 255);
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = c;
+}
+
+// 21. Ripple: rainbow rings spreading out from the middle of every character
+void styleRipple(Panel &P) {
+  uint8_t t = millis() / 6;
+  for (int i = 0; i < P.numLeds; i++)
+    P.fx[i] = hsv(gHue + P.rad[i] * 2 - t, 255, 140 + wave8(P.rad[i] * 3 - t * 2) * 115 / 255);
+}
+
+// 22. Starry night: deep blue sky with white and gold stars twinkling
+void styleStars(Panel &P) {
+  if (P.styleInit) memset(P.glint, 0, sizeof(P.glint));
+  if (random(100) < 30) {
+    int i = random(P.numLeds);
+    if (!P.glint[i]) { P.glint[i] = 255; P.jOffset[i] = random(2); }
+  }
+  for (int i = 0; i < P.numLeds; i++) {
+    P.glint[i] = P.glint[i] > 4 ? P.glint[i] - 5 : 0;
+    uint8_t s = P.glint[i] > 127 ? (255 - P.glint[i]) * 2 : P.glint[i] * 2;
+    RGB star = P.jOffset[i] ? rgb(255, 190, 70) : rgb(255, 255, 255);
+    P.fx[i] = addRGB(hsv(165, 255, 90), scaleRGB(star, s));
+  }
+}
+
+// 23. Frost: icy white and pale blue shimmer
+void styleFrost(Panel &P) {
+  if (P.styleInit) for (int i = 0; i < P.numLeds; i++) P.jOffset[i] = random(256);
+  long t = millis() / 10;
+  for (int i = 0; i < P.numLeds; i++)
+    P.fx[i] = hsv(140 + wave8(P.xs[i] - t / 3) / 10,
+                  40 + wave8(P.jOffset[i] + t * 3 / 2) * 120 / 255,
+                  170 + wave8(P.jOffset[i] * 2 + t) * 85 / 255);
+}
+
+// 24. Neon: pink and cyan tubes, alternating characters, with the odd flicker
+void styleNeon(Panel &P) {
+  if (P.styleInit) memset(P.glint, 0, sizeof(P.glint));
+  if (random(1000) < 15) P.glint[random(P.numSlots)] = 8;          // glint[] = flicker frames per slot
+  for (int i = 0; i < P.numLeds; i++) {
+    int s = P.slot[i];
+    RGB c = (s % 2 == 0) ? rgb(255, 20, 150) : rgb(0, 220, 255);
+    if (P.glint[s] & 2) c = scaleRGB(c, 120);
+    P.fx[i] = c;
+  }
+  for (int s = 0; s < P.numSlots; s++) if (P.glint[s]) P.glint[s]--;
+}
+
+// 25. Elevator: a bright band bouncing up and down, changing colour each bounce
+void styleElevator(Panel &P) {
+  const unsigned long HALF = 1200;
+  unsigned long n = millis() / HALF, t = millis() % HALF;
+  int pos = (n % 2 == 0) ? t * 255 / HALF : 255 - t * 255 / HALF;
+  uint8_t h = n * 40;
+  for (int i = 0; i < P.numLeds; i++) {
+    int d = abs((int)P.ys[i] - pos);
+    P.fx[i] = hsv(h + 128, 255, 100);
+    if (d < 50) P.fx[i] = addRGB(P.fx[i], hsv(h, 200, 255 - d * 4));
+  }
+}
+
+// 26. Split: top and bottom halves in opposite colours, the line between them drifting
+void styleSplit(Panel &P) {
+  int boundary = 128 + ((int)wave8(millis() / 20) - 128) / 2;
+  for (int i = 0; i < P.numLeds; i++) {
+    int d = P.ys[i] - boundary;
+    P.fx[i] = d < -15 ? hsv(gHue) : d > 15 ? hsv(gHue + 128) : rgb(255, 255, 255);
+  }
+}
+
+// 27. Checkerboard: neighbouring characters in two colours that swap every 2 seconds
+void styleChecker(Panel &P) {
+  unsigned long t = millis() % 4000;
+  int amt = t < 1700 ? 0 : t < 2000 ? (t - 1700) * 255 / 300 : t < 3700 ? 255 : 255 - (t - 3700) * 255 / 300;
+  RGB a = hsv(gHue), b = hsv(gHue + 100);
+  for (int i = 0; i < P.numLeds; i++) {
+    bool even = P.slot[i] % 2 == 0;
+    P.fx[i] = blendRGB(even ? a : b, even ? b : a, amt);
+  }
+}
+
+// 28. Confetti: every segment its own colour, changing at random
+void colourSegment(Panel &P, int c, int s, uint8_t h) {
+  for (int k = 0; k < P.ledsPerSeg; k++) P.jOffset[physLed(P, c, s, k)] = h;
+}
+void styleConfetti(Panel &P) {
+  if (P.styleInit) {
+    for (int i = 0; i < P.numLeds; i++) P.jOffset[i] = random(256);
+    for (int c = 0; c < P.numChars; c++)
+      for (int s = 0; s < P.segsPerChar; s++) colourSegment(P, c, s, random(256));
+  }
+  if (random(100) < 25) colourSegment(P, random(P.numChars), random(P.segsPerChar), random(256));
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = hsv(P.jOffset[i]);
+}
+
+// 29. Fireworks: bursts of colour ring out from a random character
+void styleFireworks(Panel &P) {
+  unsigned long el = millis() - P.burstStart;
+  if (P.styleInit || el > 1400) {
+    P.burstStart = millis();
+    el = 0;
+    P.burstSlot = random(P.numSlots);
+    P.burstHue = random(256);
+  }
+  int r = el * 300 / 1000;                       // ring radius grows
+  uint8_t fade = 255 - el * 255 / 1400;
+  for (int i = 0; i < P.numLeds; i++) {
+    P.fx[i] = hsv(gHue, 180, 90);
+    if (P.slot[i] != P.burstSlot) continue;
+    int d = abs((int)P.rad[i] - r);
+    if (d < 50) P.fx[i] = addRGB(P.fx[i], hsv(P.burstHue, 150, (255 - d * 5) * fade / 255));
+    else if (P.rad[i] < r) P.fx[i] = addRGB(P.fx[i], hsv(P.burstHue, 255, fade / 3));
+  }
+}
+
+// 30. Swirl: one big rainbow turning around the middle of each display
+void styleSwirl(Panel &P) {
+  uint8_t t = (millis() * 256UL / 4000) & 0xFF;
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = hsv(P.gang[i] - t);
+}
+
+// 31. Classic rainbow: the effect from the original version of this clock. Same colour wheel (red -> green ->
+//     blue in straight lines, rather than HSV), each LED 21 steps further round the wheel than the one before it
+//     on its strip, and about the same speed (one full turn in ~8 s).
+RGB classicWheel(uint8_t pos) {
+  if (pos < 85) return rgb(pos * 3, 255 - pos * 3, 0);
+  if (pos < 170) { pos -= 85; return rgb(255 - pos * 3, 0, pos * 3); }
+  pos -= 170;
+  return rgb(0, pos * 3, 255 - pos * 3);
+}
+void styleClassic(Panel &P) {
+  uint8_t j = (millis() / 31) & 0xFF;
+  for (int i = 0; i < P.numLeds; i++) P.fx[i] = classicWheel((i * 21 + j) & 0xFF);
+}
+
+typedef void (*Style)(Panel &P);
+Style STYLES[] = {styleRainbow, stylePlasma, styleFire, styleScanner, styleDigitColours,
+                  styleBreathe, styleSparkle, styleSunset, styleCycle, styleJewels,
+                  styleTrans, styleSpin, styleOcean, styleAurora, styleComet, styleMatrix,
+                  styleWipe, styleLava, styleCandy, styleHeartbeat, styleRipple, styleStars,
+                  styleFrost, styleNeon, styleElevator, styleSplit, styleChecker, styleConfetti,
+                  styleFireworks, styleSwirl, styleClassic};
+const char *STYLE_NAMES[] = {"Rainbow", "Plasma", "Fire", "Scanner", "Character colours",
+                             "Breathe", "Sparkle", "Sunset", "Colour cycle", "Jewels",
+                             "Trans", "Spinning rainbow", "Ocean", "Aurora", "Comet", "Matrix rain",
+                             "Colour wipe", "Lava lamp", "Candy stripes", "Heartbeat", "Ripple",
+                             "Starry night", "Frost", "Neon", "Elevator", "Split", "Checkerboard",
+                             "Confetti", "Fireworks", "Swirl", "Classic rainbow"};
+const int NUM_STYLES = sizeof(STYLES) / sizeof(STYLES[0]);
+
+int  currentStyle  = 0;
+bool autoStyle     = true;      // false = an effect was picked in the Serial Monitor (until "a")
+int  lastHour = -1;
+
+void setStyle(int n) {
+  currentStyle = (n + NUM_STYLES) % NUM_STYLES;
+  for (int p = 0; p < NUM_PANELS; p++) panels[p].styleInit = true;
+  Log.print("Style "); Log.print(currentStyle + 1);
+  Log.print(": ");     Log.println(STYLE_NAMES[currentStyle]);
+}
+
+// ---------------- Hourly show ----------------
+const unsigned long HOUR_SHOW_MS = 5000;
+
+void startHourShow() {
+  for (int p = 0; p < NUM_PANELS; p++) {
+    panels[p].hourShowStart = millis();
+    panels[p].hourShowActive = true;
+  }
+}
+
+// Characters stay on screen; colours blend to a fast rainbow with sparkles and back
+void applyHourShow(Panel &P, unsigned long el) {
+  int amt = 255;
+  if (el < 500) amt = el * 255 / 500;
+  else if (el > HOUR_SHOW_MS - 1000) amt = (HOUR_SHOW_MS - el) * 255 / 1000;
+  for (int i = 0; i < P.numLeds; i++) {
+    RGB party = hsv(el / 3 + P.xs[i] * 2);
+    if (random(100) < 8) party = rgb(255, 255, 255);
+    P.fx[i] = rgb((P.fx[i].r * (255 - amt) + party.r * amt) / 255,
+                  (P.fx[i].g * (255 - amt) + party.g * amt) / 255,
+                  (P.fx[i].b * (255 - amt) + party.b * amt) / 255);
+  }
+}
+
+// ---------------- Drawing ----------------
+// The left or right LED of character c's middle bar (13-segment displays), worked out from where the LEDs
+// actually sit as the viewer sees them, so it's right on an upside-down display too.
+int middleBarLed(Panel &P, int c, bool left) {
+  int a = physLed(P, c, S_G, 0), b = physLed(P, c, S_G, 1);
+  bool aIsLeft = P.xs[a] < P.xs[b];
+  return (aIsLeft == left) ? a : b;
+}
+
+void setSegLevel(Panel &P, int c, int s, uint8_t lvl) {
+  for (int k = 0; k < P.ledsPerSeg; k++) {
+    int i = physLed(P, c, s, k);
+    if (lvl > P.level[i]) P.level[i] = lvl;
+  }
+}
+
+void renderPanel(Panel &P) {
+  if (!P.hasContent) return;
+
+  // --- brightness of every segment (crossfade only the segments that change) ---
+  memset(P.level, 0, sizeof(P.level));
+  for (int c = 0; c < P.numChars; c++) {
+    uint16_t mask = P.target[c];
+    if (!P.started) P.fromMask[c] = P.toMask[c] = mask;
+    if (mask != P.toMask[c]) {
+      P.fromMask[c] = P.toMask[c];
+      P.toMask[c] = mask;
+      P.fadeStart[c] = millis();
+    }
+    unsigned long el = millis() - P.fadeStart[c];
+    unsigned long fadeLen = P.fadeMs ? P.fadeMs : FADE_MS;
+    uint8_t f = el >= fadeLen ? 255 : el * 255 / fadeLen;
+    for (int s = 0; s < P.segsPerChar; s++) {
+      if (P.segsPerChar == 13 && s == S_G) {        // middle bar: each LED on its own (full bar = both)
+        for (int half = 0; half < 2; half++) {
+          uint16_t bits = SG | (half == 0 ? SGL : SGR);
+          bool was = P.fromMask[c] & bits;
+          bool now = P.toMask[c] & bits;
+          uint8_t lvl = (now && was) ? 255 : now ? f : was ? 255 - f : 0;
+          int i = middleBarLed(P, c, half == 0);
+          if (lvl > P.level[i]) P.level[i] = lvl;
+        }
+        continue;
+      }
+      bool was = P.fromMask[c] & (1 << s);
+      bool now = P.toMask[c] & (1 << s);
+      if (now && was) setSegLevel(P, c, s, 255);
+      else if (now)   setSegLevel(P, c, s, f);
+      else if (was)   setSegLevel(P, c, s, 255 - f);
+    }
+  }
+  P.started = true;
+
+  bool sepOn = !P.hideSep && (!P.blinkSep || (millis() % 1000) < 500);
+  for (int i = 0; i < P.numSep; i++) P.level[P.sepLed[i]] = sepOn ? 255 : 0;
+
+  // --- colour ---
+  STYLES[currentStyle](P);
+  P.styleInit = false;
+
+  if (P.hourShowActive) {
+    unsigned long el = millis() - P.hourShowStart;
+    if (el < HOUR_SHOW_MS) applyHourShow(P, el);
+    else P.hourShowActive = false;
+  }
+
+  for (int i = 0; i < P.numLeds; i++)
+    P.out[i] = scaleRGB(P.fx[i], max((int)P.level[i], GHOST));
+
+  // --- brightness + send ---
+  P.strip->setBrightness(P.brightness);
+  for (int i = 0; i < P.numLeds; i++) P.strip->setPixelColor(i, P.out[i].r, P.out[i].g, P.out[i].b);
+  P.strip->show();
+}
+
+// ================= PUBLIC FUNCTIONS =================
+// Time: display 0 (top, pin 10) or 1 (bottom, pin 1), hours 0-23, minutes 0-59.
+// In 12-hour mode the leading zero is left blank: " 9:05", "12:30".
+void setClockTime(int display, int hours, int minutes) {
+  if (display < 0 || display > 1) return;
+  Panel &P = panels[display == 0 ? TIME_A_PANEL : TIME_B_PANEL];
+  if (!P.manual) {                       // a value typed in the Serial Monitor wins until "live"
+    int shown = hours;
+    if (twelveHourMode) {
+      shown = hours % 12;
+      if (shown == 0) shown = 12;
+    }
+    P.target[0] = (twelveHourMode && shown < 10) ? 0 : DIGIT7[(shown / 10) % 10];
+    P.target[1] = DIGIT7[shown % 10];
+    P.target[2] = DIGIT7[minutes / 10];
+    P.target[3] = DIGIT7[minutes % 10];
+    P.hasContent = true;
+  }
+
+  if (display == 0) {
+    if (hours != lastHour) {
+      if (lastHour >= 0 && HOUR_SHOW) startHourShow();
+      lastHour = hours;
+    }
+  }
+}
+
+// Put text on any panel, as the viewer reads it, left to right
+void writePanelText(Panel &P, const char *text) {
+  int len = strlen(text);
+  for (int c = 0; c < P.numChars; c++) {
+    char ch = c < len ? text[c] : ' ';
+    P.target[c] = (P.segsPerChar == 7) ? charMask7(ch) : charMask13(ch);
+  }
+  P.hasContent = true;
+}
+
+// Show any text on the DATE_PANEL (4 characters) or DAY_PANEL (3 characters)
+void setPanelText(int panel, const char *text) {
+  if (panel < 0 || panel >= NUM_PANELS) return;
+  if (panels[panel].manual) return;      // a value typed in the Serial Monitor wins until "live"
+  writePanelText(panels[panel], text);
+}
+
+// Date: weekday 0 = Sunday ... 6 = Saturday, day 1-31, month 1-12
+void setClockDate(int weekday, int day, int month) {
+  char buf[5];
+  int first  = dateDayFirst ? day : month;
+  int second = dateDayFirst ? month : day;
+  buf[0] = '0' + (first / 10) % 10;
+  buf[1] = '0' + first % 10;
+  buf[2] = '0' + (second / 10) % 10;
+  buf[3] = '0' + second % 10;
+  buf[4] = 0;
+  setPanelText(DATE_PANEL, buf);
+  setPanelText(DAY_PANEL, DAY_NAMES[((weekday % 7) + 7) % 7]);
+}
+
+// Call every loop: reads the Serial Monitor and redraws everything at FPS
+void clockUpdate() {
+  static unsigned long frameTimer = 0, hueTimer = 0;
+  handleSerial();
+  if (!every(frameTimer, 1000 / FPS)) return;
+  if (every(hueTimer, 40)) gHue++;
+  for (int p = 0; p < NUM_PANELS; p++) renderPanel(panels[p]);
+}
+
+// ================= SERIAL MONITOR COMMANDS =================
+void printHelp() {
+  Log.println();
+  Log.println("---- LED clock commands (type, then press Enter) ----");
+  Log.println("Effects:  1-31 show that effect (holds it)   n next   t Trans   s Spinning rainbow");
+  Log.println("          a  back to the effects chosen on the setup page");
+  Log.println("Show:     time 12:34     both time displays");
+  Log.println("          top 12:34      top only       bottom 08:15   bottom only");
+  Log.println("          date 0511      date display (any 4 characters, e.g. date HIYA)");
+  Log.println("          day THU        day display (any 3 characters)");
+  Log.println("          live           back to the real time and date");
+  Log.println("          msg HELLO WORLD  show a message on the date/day displays (msg on its own clears it)");
+  Log.println("Other:    h hourly show   sync  get the time from the time server now   ? or help");
+  Log.println("          rtc  state of the DS3231 alarms and the INT pin   pmic  battery charger status");
+  Log.println("Effects: 1 Rainbow 2 Plasma 3 Fire 4 Scanner 5 Character colours 6 Breathe");
+  Log.println("         7 Sparkle 8 Sunset 9 Colour cycle 10 Jewels 11 Trans 12 Spinning rainbow");
+  Log.println("         13 Ocean 14 Aurora 15 Comet 16 Matrix rain 17 Colour wipe 18 Lava lamp");
+  Log.println("         19 Candy stripes 20 Heartbeat 21 Ripple 22 Starry night 23 Frost 24 Neon");
+  Log.println("         25 Elevator 26 Split 27 Checkerboard 28 Confetti 29 Fireworks 30 Swirl");
+  Log.println("         31 Classic rainbow (the original clock's effect)");
+  Log.println();
+}
+
+// Show typed text on one panel and hold it there until "live"
+// ":" and "." are dropped ("12:34" -> "1234"); spaces too for numbers ("05 11" -> "0511")
+void manualText(int panel, const char *text) {
+  bool allDigits = true;
+  for (int i = 0; text[i]; i++)
+    if (!isdigit(text[i]) && text[i] != ' ' && text[i] != ':' && text[i] != '.') allDigits = false;
+  char buf[8];
+  int n = 0;
+  for (int i = 0; text[i] && n < 7; i++) {
+    if (text[i] == ':' || text[i] == '.') continue;
+    if (text[i] == ' ' && allDigits) continue;
+    buf[n++] = text[i];
+  }
+  buf[n] = 0;
+  panels[panel].manual = true;
+  writePanelText(panels[panel], buf);
+}
+
+void runCommand(char *line) {
+  // trim spaces
+  while (*line == ' ') line++;
+  int len = strlen(line);
+  while (len > 0 && line[len - 1] == ' ') line[--len] = 0;
+  if (len == 0) return;
+
+  // split into command word and the rest
+  char *arg = strchr(line, ' ');
+  if (arg) { *arg++ = 0; while (*arg == ' ') arg++; } else arg = line + len;
+  for (char *p = line; *p; p++) *p = tolower(*p);
+
+  // style by number
+  if (isdigit(line[0])) {
+    int n = atoi(line);
+    if (n == 0) n = 10;                                // old shortcut: 0 = style 10
+    if (n >= 1 && n <= NUM_STYLES) { autoStyle = false; setStyle(n - 1); }
+    else { Log.print("Effect numbers are 1 to "); Log.println(NUM_STYLES); }
+    return;
+  }
+
+  if      (!strcmp(line, "a"))      { autoStyle = true; Log.println("Back to the effects chosen on the setup page"); }
+  else if (!strcmp(line, "n"))      { autoStyle = false; setStyle(currentStyle + 1); }
+  else if (!strcmp(line, "t"))      { autoStyle = false; setStyle(10); }
+  else if (!strcmp(line, "s"))      { autoStyle = false; setStyle(11); }
+  else if (!strcmp(line, "h"))      { startHourShow(); }
+  else if (!strcmp(line, "msg"))    { serialMessage(arg); }
+  else if (!strcmp(line, "rtc"))    { logAlarmStatus(); }
+  else if (!strcmp(line, "pmic"))   { logChargerStatus(); }
+  else if (!strcmp(line, "sync"))   { if (WiFi.status() == WL_CONNECTED && rtcOk) { syncTimeFromNTP(); drawClock(); } else Log.println("Not connected to Wi-Fi"); }
+  else if (!strcmp(line, "time"))   { manualText(TIME_A_PANEL, arg); manualText(TIME_B_PANEL, arg); }
+  else if (!strcmp(line, "top"))    { manualText(TIME_A_PANEL, arg); }
+  else if (!strcmp(line, "bottom")) { manualText(TIME_B_PANEL, arg); }
+  else if (!strcmp(line, "date"))   { manualText(DATE_PANEL, arg); }
+  else if (!strcmp(line, "day"))    { manualText(DAY_PANEL, arg); }
+  else if (!strcmp(line, "live"))   {
+    for (int p = 0; p < NUM_PANELS; p++) panels[p].manual = false;
+    Log.println("Showing the real time and date again");
+  }
+  else if (!strcmp(line, "?") || !strcmp(line, "help")) { printHelp(); }
+  else { Log.print("Unknown command: "); Log.print(line); Log.println("   (type help)"); }
+}
+
+// Collects typed characters into a line. A line ends with Enter, or after a
+// short pause (so it also works with "No line ending" in the Serial Monitor).
+void handleSerial() {
+  static char buf[40];
+  static int n = 0;
+  static unsigned long lastChar = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    lastChar = millis();
+    if (c == '\n' || c == '\r') {
+      buf[n] = 0;
+      if (n > 0) runCommand(buf);
+      n = 0;
+    } else if (n < (int)sizeof(buf) - 1) {
+      buf[n++] = c;
+    }
+  }
+  if (n > 0 && millis() - lastChar > 300) {
+    buf[n] = 0;
+    runCommand(buf);
+    n = 0;
+  }
+}
+
+
+// ================= SETTINGS =================
+#define SETTINGS_MAGIC 0x52435036UL   // "RCP6": change this if the Credentials layout changes
+
+// How often the effect changes (setup page "Change effect"), in seconds of top-row local time
+const uint32_t FX_PERIODS[] = {60UL, 3600UL, 43200UL, 86400UL};
+const char *FX_PERIOD_NAMES[] = {"Every minute", "Every hour", "Every 12 hours", "Every 24 hours"};
+const uint8_t FX_PERIOD_COUNT = sizeof(FX_PERIODS) / sizeof(FX_PERIODS[0]);
+
+uint32_t allEffectsMask() {
+  return NUM_STYLES >= 32 ? 0xFFFFFFFFUL : ((1UL << NUM_STYLES) - 1);
+}
+
+void setText(char *dst, size_t size, const char *src) {
+  strncpy(dst, src, size - 1);
+  dst[size - 1] = 0;
+}
+
+// Called after reading flash. The first time (and after every reflash, which blanks the settings) it fills
+// in defaults, then turns the stored text settings into flags the rest of the sketch uses.
+void loadSettings() {
+  if (owner.settingsMagic != SETTINGS_MAGIC) {
+    owner.tz1Offset = -480;  owner.tz1Dst = DST_US;   // Pacific
+    owner.tz2Offset = 0;     owner.tz2Dst = DST_EU;   // UK
+    owner.fxMask = allEffectsMask();
+    owner.fxInterval = 1;                             // every hour
+    setText(owner.brightness,   sizeof(owner.brightness),   "150");
+    setText(owner.temp,         sizeof(owner.temp),         "of");
+    setText(owner.twelvehr,     sizeof(owner.twelvehr),     "of");
+    setText(owner.USDateFormat, sizeof(owner.USDateFormat), "on");
+    setText(owner.tempUnits,    sizeof(owner.tempUnits),    "C");
+    setText(owner.dimmer,       sizeof(owner.dimmer),       "on");
+    owner.tempSensor = 0;
+    owner.tempOffset10 = 0;
+    owner.logHost[0] = 0;
+    owner.logPort = 4210;
+    owner.mqttHost[0] = 0;
+    owner.mqttPort = 1883;
+    owner.mqttUser[0] = 0;
+    owner.mqttPass[0] = 0;
+    owner.fxFixed = -1;
+    owner.msgSeconds = 30;
+    owner.settingsMagic = SETTINGS_MAGIC;
+  }
+  owner.fxMask &= allEffectsMask();
+  if (owner.fxMask == 0) owner.fxMask = allEffectsMask();
+  if (owner.fxInterval >= FX_PERIOD_COUNT) owner.fxInterval = 1;
+  if (owner.tempSensor > 1) owner.tempSensor = 0;
+  owner.tempOffset10 = constrain(owner.tempOffset10, -200, 200);
+  owner.logHost[sizeof(owner.logHost) - 1] = 0;
+  if (owner.fxFixed < -1 || owner.fxFixed >= NUM_STYLES) owner.fxFixed = -1;
+  if (owner.msgSeconds < 3 || owner.msgSeconds > 3600) owner.msgSeconds = 30;
+
+  twelveHourMode = !strcmp(owner.twelvehr, "on");
+  dateDayFirst   = !strcmp(owner.USDateFormat, "of");   // the "dd-mm" option is stored as "of"
+  showTemp       = !strcmp(owner.temp, "on");
+  tempInF        = !strcmp(owner.tempUnits, "F");
+  autoDimming    = strcmp(owner.dimmer, "of") != 0;
+
+  loadTimezoneSettings();
+  Log.print("Effects mask: 0x");
+  Log.print(owner.fxMask, HEX);
+  Log.print(", change: ");
+  Log.println(FX_PERIOD_NAMES[owner.fxInterval]);
+}
+
+// ================= EFFECT ROTATION =================
+// The ticked effects are used in order, one per period (minute / hour / 12 hours / day of top-row local
+// time). It's worked out from the time alone, so after a restart the clock comes back on the same effect,
+// and the daily change happens at local midnight (the 12-hour one at midnight and noon).
+int scheduledEffect(time_t localNow) {
+  uint32_t mask = owner.fxMask & allEffectsMask();
+  if (mask == 0) mask = allEffectsMask();
+  int count = 0;
+  for (int i = 0; i < NUM_STYLES; i++)
+    if (mask & (1UL << i)) count++;
+  int pick = ((uint32_t)localNow / FX_PERIODS[owner.fxInterval]) % count;
+  for (int i = 0; i < NUM_STYLES; i++)
+    if (mask & (1UL << i)) {
+      if (pick == 0) return i;
+      pick--;
+    }
+  return 0;
+}
+
+void updateEffect(time_t localNow) {
+  if (!autoStyle) return;               // an effect picked in the Serial Monitor wins until "a"
+  int s = scheduledEffect(localNow);
+  if (s != currentStyle) setStyle(s);
+}
+
+// ================= BRIGHTNESS =================
+// Auto-dimming follows the light sensor; otherwise the slider on the setup page sets the time displays,
+// with the date and day displays at DATE_DAY_PERCENT of that.
+void setPanelBrightness(uint8_t timeLevel, uint8_t dateLevel) {
+  panels[TIME_A_PANEL].brightness = timeLevel;
+  panels[TIME_B_PANEL].brightness = timeLevel;
+  panels[DATE_PANEL].brightness = dateLevel;
+  panels[DAY_PANEL].brightness = dateLevel;
+}
+
+void updateBrightness() {
+  static unsigned long last = 0;
+  if (!every(last, 1000)) return;
+  applyBrightness();
+}
+
+void applyBrightness() {
+  if (!autoDimming) {
+    int b = constrain(atoi(owner.brightness), 1, 255);
+    setPanelBrightness(b, max(1, b * DATE_DAY_PERCENT / 100));
+    return;
+  }
+  // readings with the light sensor facing the couch, so light exposure is limited:
+  //   ~490 at 5pm, 28-40 with all lights off at 9pm, 170-180 with only the dining room light on
+  //   at 7:30 with curtains closed, >400 at 8:15am in summer with curtains open and no lights on
+  int light = analogRead(pResistor);
+  if (light >= 450)      setPanelBrightness(240, 125);
+  else if (light >= 150) setPanelBrightness(175, 75);
+  else if (light >= 50)  setPanelBrightness(75, 20);
+  else                   setPanelBrightness(10, 2);
+}
+
+// ================= TIME =================
+bool timeValid = false;      // false until the RTC or the time server has given a believable time
+uint32_t ntpRetryAt = 0;     // UTC seconds; 0 = no retry pending (next sync is the daily one at noon)
+
+void sendNTPpacket(IPAddress &address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;            // Stratum, or type of clock
+  packetBuffer[2] = 6;            // Polling Interval
+  packetBuffer[3] = 0xEC;         // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  Udp.beginPacket(address, 123);  // NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
+
+// ---- Time server (NTP) ----
+// Each daily sync is logged in detail, so a wrong time can be traced: which server answered, how good it says it
+// is, the exact time it sent, what the DS3231 said before, and the result on both rows.
+// Replies are checked before they're used:
+//  - a server that marks itself unsynchronised (leap indicator 3, stratum 0 or above 15) is ignored
+//  - a year outside 2024-2099 is ignored
+//  - if a reply would move the clock by more than NTP_MAX_JUMP_S, a second server has to agree (within 2 s)
+//    before the clock accepts it; otherwise the DS3231's own time is kept
+#define NTP_MAX_JUMP_S  120
+const char *NTP_SERVERS[] = {"0.us.pool.ntp.org", "1.us.pool.ntp.org", "2.us.pool.ntp.org"};
+
+// Details of the last reply (filled in by ntpQuery)
+uint32_t ntpUtc = 0;          // UTC, whole seconds
+uint16_t ntpMs = 0;           // fraction of a second, ms (already allowing for half the round trip)
+int ntpStratum = 0, ntpLeap = 0;
+unsigned long ntpRtt = 0;     // round trip, ms
+IPAddress ntpAddr;
+
+// Result of the last sync, for Home Assistant ("Last time sync", "Time sync result", "Clock drift")
+char syncResultText[100] = "";
+uint32_t lastSyncUtc = 0;     // UTC of the last successful sync (0 = none yet)
+long lastSyncDrift = 0;       // seconds the DS3231 was off at that sync (+ = it was behind)
+bool syncStateDirty = false;  // tells MQTT to publish the above
+int syncRejected = 0;         // replies refused during the current sync
+
+// "2026-11-18 19:55:12"
+void logDateTime(uint32_t t) {
+  char b[24];
+  snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d", year(t), month(t), day(t), hour(t), minute(t), second(t));
+  Log.print(b);
+}
+
+// "top row 11:55:12 on 2026-11-18 (UTC-8, standard time)"
+void logRowTime(const char *label, Timezone &tz, uint32_t utc) {
+  TimeChangeRule *tcr;
+  time_t t = tz.toLocal(utc, &tcr);
+  long off = ((long)t - (long)utc) / 60;
+  char b[72];
+  snprintf(b, sizeof(b), "%s %02d:%02d:%02d on %04d-%02d-%02d (UTC%c%ld", label, hour(t), minute(t), second(t),
+           year(t), month(t), day(t), off < 0 ? '-' : '+', labs(off) / 60);
+  Log.print(b);
+  if (labs(off) % 60) {
+    snprintf(b, sizeof(b), ":%02ld", labs(off) % 60);
+    Log.print(b);
+  }
+  Log.print(strcmp(tcr->abbrev, "DST") ? ", standard time)" : ", daylight time)");
+}
+
+// Ask one server. Returns 0 = good reply, 1 = DNS lookup failed, 2 = no reply, 3 = reply rejected.
+int ntpQuery(const char *host) {
+  if (WiFi.hostByName(host, ntpAddr) != 1) {
+    Log.print("NTP: can't look up ");
+    Log.println(host);
+    return 1;
+  }
+  Udp.begin(localPort);
+  unsigned long sent = millis();
+  sendNTPpacket(ntpAddr);
+  int result = 2;
+  while (millis() - sent < 2000) {
+    if (Udp.parsePacket() >= NTP_PACKET_SIZE) {
+      ntpRtt = millis() - sent;
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);
+      ntpLeap = packetBuffer[0] >> 6;
+      ntpStratum = packetBuffer[1];
+      uint32_t secs = (uint32_t)packetBuffer[40] << 24 | (uint32_t)packetBuffer[41] << 16 |
+                      (uint32_t)packetBuffer[42] << 8 | packetBuffer[43];
+      uint32_t frac = (uint32_t)packetBuffer[44] << 24 | (uint32_t)packetBuffer[45] << 16 |
+                      (uint32_t)packetBuffer[46] << 8 | packetBuffer[47];
+      uint32_t ms = (uint32_t)(((uint64_t)frac * 1000) >> 32) + ntpRtt / 2;   // the reply took ~half the round trip
+      ntpUtc = secs - 2208988800UL + ms / 1000;
+      ntpMs = ms % 1000;
+      result = 0;
+      break;
+    }
+    delay(5);
+  }
+  Udp.stop();
+
+  Log.print("NTP: ");
+  Log.print(host);
+  Log.print(" (");
+  Log.print(ntpAddr);
+  Log.print(") ");
+  if (result == 2) {
+    Log.println("didn't reply within 2 s");
+    return 2;
+  }
+  char b[16];
+  snprintf(b, sizeof(b), ".%03u UTC", ntpMs);
+  Log.print("stratum ");
+  Log.print(ntpStratum);
+  Log.print(", leap ");
+  Log.print(ntpLeap);
+  Log.print(", round trip ");
+  Log.print(ntpRtt);
+  Log.print(" ms -> ");
+  logDateTime(ntpUtc);
+  Log.println(b);
+  if (ntpLeap == 3 || ntpStratum == 0 || ntpStratum > 15) {
+    syncRejected++;
+    Log.println("NTP: rejected - the server says it isn't synchronised itself");
+    return 3;
+  }
+  if (year(ntpUtc) < 2024 || year(ntpUtc) > 2099) {
+    syncRejected++;
+    Log.println("NTP: rejected - impossible year");
+    return 3;
+  }
+  return 0;
+}
+
+// Set the DS3231 from the last good reply, at the start of a second so it's right to within a few ms.
+void applyNtpTime(uint32_t rtcBefore, const char *host) {
+  delay(1000 - ntpMs);                  // wait for the next whole second...
+  uint32_t setTo = ntpUtc + 1;          // ...which is this one
+  rtc.adjust(DateTime(setTo));
+  timeValid = true;
+  long off = (long)ntpUtc - (long)rtcBefore;
+  Log.print("NTP: DS3231 said ");
+  logDateTime(rtcBefore);
+  Log.print(" UTC, so it was ");
+  if (off == 0) Log.println("right (to within a second)");
+  else {
+    Log.print(off > 0 ? "behind by about " : "ahead by about ");
+    Log.print(labs(off));
+    Log.println(" s - corrected");
+  }
+  lastSyncUtc = setTo;
+  lastSyncDrift = off;
+  char change[24];
+  if (off == 0) setText(change, sizeof(change), "already right");
+  else snprintf(change, sizeof(change), "corrected by %s%ld s", off > 0 ? "+" : "", off);
+  snprintf(syncResultText, sizeof(syncResultText), "OK: %s (%s, stratum %d)%s", change, host, ntpStratum,
+           syncRejected ? ", after refusing a bad reply" : "");
+  syncStateDirty = true;
+  Log.print("NTP: clock set. ");
+  logRowTime("Top row", tzMain, setTo);
+  Log.print(", ");
+  logRowTime("bottom row", tzSecond, setTo);
+  Log.println();
+}
+
+// Returns 0 = clock set, 1 = couldn't look up any server, 2 = no usable reply (the DS3231 keeps its own time).
+int syncTimeFromNTP() {
+  Log.println("NTP: syncing the time");
+  syncRejected = 0;
+  int dnsFails = 0;
+  bool haveCandidate = false;           // a big jump waiting for a second server to agree
+  uint32_t candidateUtc = 0;
+  for (unsigned i = 0; i < sizeof(NTP_SERVERS) / sizeof(NTP_SERVERS[0]); i++) {
+    int r = ntpQuery(NTP_SERVERS[i]);
+    if (r == 1) dnsFails++;
+    if (r != 0) continue;
+    uint32_t rtcBefore = rtc.now().unixtime();
+    long jump = (long)ntpUtc - (long)rtcBefore;
+    if (timeValid && labs(jump) > NTP_MAX_JUMP_S) {
+      if (haveCandidate && labs((long)ntpUtc - (long)candidateUtc) <= 2) {
+        Log.println("NTP: a second server agrees, so the big change is accepted");
+      } else {
+        Log.print("NTP: WARNING - this would move the clock by ");
+        Log.print(jump);
+        Log.println(" s; asking another server to confirm before changing anything");
+        haveCandidate = true;
+        candidateUtc = ntpUtc;
+        continue;
+      }
+    }
+    applyNtpTime(rtcBefore, NTP_SERVERS[i]);
+    return 0;
+  }
+  bool noDns = dnsFails == (int)(sizeof(NTP_SERVERS) / sizeof(NTP_SERVERS[0]));
+  if (haveCandidate) setText(syncResultText, sizeof(syncResultText), "Big change not confirmed by a second server - kept the DS3231's time");
+  else if (noDns) setText(syncResultText, sizeof(syncResultText), "Couldn't look up the time servers - kept the DS3231's time");
+  else if (syncRejected) setText(syncResultText, sizeof(syncResultText), "Only bad replies - kept the DS3231's time");
+  else setText(syncResultText, sizeof(syncResultText), "No reply from the time servers - kept the DS3231's time");
+  syncStateDirty = true;
+  Log.print("NTP: ");
+  Log.println(syncResultText);
+  return noDns ? 1 : 2;
+}
+
+// ---- Temperature ----
+// Two possible sensors, chosen on the setup page: the DS3231's own (it measures the clock chip, so it can
+// read a little warm) or a DS18B20 probe on DS18B20_PIN. The DS18B20 is read without waiting: each alarm
+// collects the reading started at the previous alarm and starts the next one.
+#if DS18B20_PIN >= 0
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18(&oneWire);
+#endif
+bool ds18Found = false;
+float ds18LastC = NAN;     // last good DS18B20 reading, in C
+
+void setupDs18() {
+#if DS18B20_PIN < 0
+  Log.println("DS18B20: none fitted (set DS18B20_PIN to use one)");
+#else
+  ds18.begin();
+  ds18Found = ds18.getDeviceCount() > 0;
+  if (ds18Found) {
+    ds18.setResolution(12);
+    ds18.setWaitForConversion(false);
+    ds18.requestTemperatures();
+    Log.println("DS18B20 found");
+  } else {
+    Log.println("DS18B20 not found (check DS18B20_PIN and the 4.7k pull-up)");
+  }
+#endif
+}
+
+void updateDs18() {
+#if DS18B20_PIN >= 0
+  if (!ds18Found) return;
+  float c = ds18.getTempCByIndex(0);
+  if (c != DEVICE_DISCONNECTED_C && c > -55 && c < 125 && c != 85.0) ds18LastC = c;   // 85.0 = not ready yet
+  ds18.requestTemperatures();   // start the next reading; returns straight away
+#endif
+}
+
+bool usingDs18() {
+  return owner.tempSensor == 1 && ds18Found && !isnan(ds18LastC);
+}
+
+float toShownUnits(float c) {
+  return tempInF ? c * 1.8 + 32 : c;
+}
+
+// Temperature as shown on the clock: chosen sensor, chosen units, plus the offset.
+float shownTemperature() {
+  float c = usingDs18() ? ds18LastC : rtc.getTemperature();
+  return toShownUnits(c) + owner.tempOffset10 / 10.0;
+}
+
+// Both sensors' readings, the offset and the result, e.g.
+// "Temperature: DS3231 24.25 C, DS18B20 21.38 C | using DS18B20, offset -1.5 -> 19.9 C (shown on the clock)"
+void logTemperatures() {
+  Log.print("Temperature: DS3231 ");
+  if (rtcOk) { Log.print(rtc.getTemperature(), 2); Log.print(" C"); }
+  else Log.print("not found");
+  Log.print(", DS18B20 ");
+  if (ds18Found && !isnan(ds18LastC)) { Log.print(ds18LastC, 2); Log.print(" C"); }
+  else Log.print(ds18Found ? "no reading yet" : "not found");
+  if (!rtcOk && !usingDs18()) { Log.println(); return; }
+  Log.print(" | using ");
+  Log.print(usingDs18() ? "DS18B20" : "DS3231");
+  Log.print(", offset ");
+  Log.print(owner.tempOffset10 / 10.0, 1);
+  Log.print(" -> ");
+  Log.print(shownTemperature(), 1);
+  Log.print(tempInF ? " F" : " C");
+  Log.println(showTemp ? " (shown on the clock)" : " (temperature display is off)");
+}
+
+// Temperature on the date display, e.g. "21 C", " 5 C", "-3 C", "100F". The day display goes blank.
+void showTemperature() {
+  int v = (int)lround(shownTemperature());
+  char unit = tempInF ? 'F' : 'C';
+  char buf[8];
+  if (v > 99 || v < -9) snprintf(buf, sizeof(buf), "%d%c", v, unit);
+  else                  snprintf(buf, sizeof(buf), "%2d %c", v, unit);
+  setPanelText(DATE_PANEL, buf);
+  setPanelText(DAY_PANEL, "");
+  panels[DATE_PANEL].hideSep = true;
+}
+
+// ---- DS3231 alarms: the RTC's own hardware decides when the displays change ----
+//   Alarm 2: every minute at :00  -> time, date, effect rotation, daily time-server sync
+//   Alarm 1: every minute at :55  -> temperature (until the :00 alarm puts the date back)
+// Both alarms pull the DS3231's INT pin (CLOCK_INTERRUPT_PIN) low. The interrupt handler only notes that it happened; the work is
+// done in loop(), because I2C reads, Serial and LED updates are not safe inside an interrupt on this board.
+// INT stays low until the alarm is cleared, so an alarm that arrives while the setup page is busy is
+// handled as soon as the loop gets back to it, never lost.
+volatile bool rtcAlarm = false;
+volatile uint32_t rtcIsrCount = 0;   // falling edges seen on CLOCK_INTERRUPT_PIN since start-up
+uint32_t minuteAlarmsHandled = 0;    // minute updates started by the DS3231's alarm
+uint32_t minuteFallbacks = 0;        // minute updates the alarm should have started but didn't
+uint32_t lastMinuteDrawn = 0;        // UTC minute (seconds / 60) last shown on the displays
+uint32_t lastTempMinute = 0;         // UTC minute the temperature was last shown
+bool alarmWarned = false;
+
+void rtcAlarmISR() {
+  rtcAlarm = true;
+  rtcIsrCount++;
+}
+
+void setupRtcAlarms() {
+  rtc.disable32K();
+  rtc.clearAlarm(1);
+  rtc.clearAlarm(2);
+  rtc.writeSqwPinMode(DS3231_OFF);                                 // INT pin signals alarms, no square wave
+  rtc.setAlarm2(rtc.now(), DS3231_A2_PerMinute);                   // every minute, at :00
+  rtc.setAlarm1(DateTime(0, 0, 0, 0, 0, 55), DS3231_A1_Second);    // every minute, when seconds = 55
+  pinMode(CLOCK_INTERRUPT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(CLOCK_INTERRUPT_PIN), rtcAlarmISR, FALLING);
+}
+
+// Time, date and effect for the current minute. Run by the minute alarm, at start-up and after a sync.
+void drawClock() {
+  if (!rtcOk) return;
+  uint32_t utc = rtc.now().unixtime();
+  lastMinuteDrawn = utc / 60;
+
+  // Time-server sync: every day at 12:00 top-row time, and hourly after a failed attempt until it works.
+  time_t localNow = tzMain.toLocal(utc);
+  bool noon = hour(localNow) == 12 && minute(localNow) == 0;
+  bool retryDue = ntpRetryAt != 0 && utc >= ntpRetryAt;
+  if ((noon || retryDue) && WiFi.status() == WL_CONNECTED) {
+    ntpRetryAt = (syncTimeFromNTP() == 0) ? 0 : utc + 3600UL;
+    utc = rtc.now().unixtime();
+  } else if (noon) {
+    ntpRetryAt = utc + 3600UL;            // no Wi-Fi at noon: try again once it's back
+  }
+  if (!timeValid) return;
+
+  time_t tMain = tzMain.toLocal(utc);
+  time_t tOther = tzSecond.toLocal(utc);
+  setClockTime(0, hour(tMain), minute(tMain));
+  setClockTime(1, hour(tOther), minute(tOther));
+  {
+    char b[96];
+    snprintf(b, sizeof(b), "Display: top %02d:%02d, bottom %02d:%02d, date %02d-%02d, %s (DS3231: ",
+             hour(tMain), minute(tMain), hour(tOther), minute(tOther),
+             dateDayFirst ? day(tMain) : month(tMain), dateDayFirst ? month(tMain) : day(tMain), DAY_NAMES[weekday(tMain) - 1]);
+    Log.print(b);
+    logDateTime(utc);
+    Log.println(" UTC)");
+  }
+
+  if (inSetupMode) {
+    setPanelText(DATE_PANEL, "SET");   // date display reads first
+    setPanelText(DAY_PANEL, "UP");
+    panels[DATE_PANEL].hideSep = true;
+  } else {
+    panels[DATE_PANEL].hideSep = false;
+    setClockDate(weekday(tMain) - 1, day(tMain), month(tMain));   // TimeLib: 1 = Sunday
+  }
+  updateEffect(tMain);
+}
+
+// Called every loop: does nothing unless the DS3231 has signalled an alarm.
+// Read one DS3231 register directly (0x0E = control, 0x0F = status), for diagnostics.
+int readDs3231Register(uint8_t reg) {
+  Wire.beginTransmission(0x68);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return -1;
+  if (Wire.requestFrom(0x68, 1) != 1) return -1;
+  return Wire.read();
+}
+
+// One line describing the alarm hardware: what the INT pin reads and what the DS3231 thinks.
+void logAlarmStatus() {
+  int ctrl = readDs3231Register(0x0E);
+  int stat = readDs3231Register(0x0F);
+  Log.print("RTC alarms: INT pin ");
+  Log.print(CLOCK_INTERRUPT_PIN);
+  Log.print(digitalRead(CLOCK_INTERRUPT_PIN) == HIGH ? " HIGH" : " LOW");
+  Log.print(", interrupts seen ");
+  Log.print(rtcIsrCount);
+  Log.print(", minute alarms handled ");
+  Log.print(minuteAlarmsHandled);
+  Log.print(", missed ");
+  Log.print(minuteFallbacks);
+  if (ctrl >= 0 && stat >= 0) {
+    Log.print(" | DS3231 alarm interrupts ");
+    Log.print((ctrl & 0x04) ? "on" : "OFF (INTCN=0)");
+    Log.print(", alarm1 ");
+    Log.print((ctrl & 0x01) ? "enabled" : "disabled");
+    Log.print(", alarm2 ");
+    Log.print((ctrl & 0x02) ? "enabled" : "disabled");
+    Log.print(", flags A1F=");
+    Log.print(stat & 0x01);
+    Log.print(" A2F=");
+    Log.print((stat >> 1) & 0x01);
+  } else {
+    Log.print(" | DS3231 registers unreadable");
+  }
+  Log.println();
+}
+
+// The once-a-minute work.
+void minuteWork() {
+  checkWiFi();
+  checkChargerStillOff();
+  drawClock();
+  if (rtcOk && timeValid && minute(tzMain.toLocal(rtc.now().unixtime())) == 0) {   // hourly status line
+    Log.print("Status: Wi-Fi ");
+    Log.print(WiFi.status() == WL_CONNECTED ? "connected" : "NOT connected");
+    Log.print(" (");
+    Log.print(WiFi.RSSI());
+    Log.print(" dBm), MQTT ");
+    Log.println(!mqttEnabled() ? "off" : mqttConnected() ? "connected" : "NOT connected");
+    logAlarmStatus();
+    logChargerStatus();
+  }
+}
+
+// Called every loop: does nothing unless the DS3231 has signalled an alarm.
+void handleRtcAlarms() {
+  if (!rtcOk) return;
+  if (!rtcAlarm && digitalRead(CLOCK_INTERRUPT_PIN) == HIGH) return;   // no alarm waiting
+  rtcAlarm = false;
+  bool minuteAlarm = rtc.alarmFired(2);
+  bool tempAlarm = rtc.alarmFired(1);
+  rtc.clearAlarm(1);   // clearing lets INT go high again, ready for the next alarm
+  rtc.clearAlarm(2);
+  updateDs18();
+  if (minuteAlarm) {
+    minuteAlarmsHandled++;
+    Log.println("Alarm 2 (minute) fired");
+    minuteWork();
+  }
+  if (tempAlarm) {
+    lastTempMinute = rtc.now().unixtime() / 60;
+    Log.println("Alarm 1 (:55) fired");
+    logTemperatures();
+    if (showTemp && timeValid && !inSetupMode) showTemperature();
+  }
+}
+
+// Safety net, checked once a second: if the minute has changed (or :55 has passed) and the DS3231's alarm
+// didn't arrive, do the work anyway and log why, once. Normally the alarm gets there first and this does
+// nothing. If it keeps happening, the INT/SQW wire from the DS3231 isn't reaching CLOCK_INTERRUPT_PIN.
+void checkMissedAlarms() {
+  static unsigned long lastCheck = 0;
+  if (!rtcOk || !timeValid || !every(lastCheck, 1000)) return;
+  uint32_t utc = rtc.now().unixtime();
+  uint32_t sec = utc % 60;
+  bool minuteMissed = (utc / 60 != lastMinuteDrawn) && sec >= 3;        // the :00 alarm is 3 s overdue
+  bool tempMissed = sec >= 58 && lastTempMinute != utc / 60;   // :55 alarm 3 s overdue
+  if (!minuteMissed && !tempMissed) return;
+  if (!alarmWarned) {
+    alarmWarned = true;
+    Log.println("WARNING: the DS3231's alarm didn't arrive, so the clock is updating itself instead.");
+    Log.print("  Check the wire from the DS3231's INT/SQW pin to pin ");
+    Log.print(CLOCK_INTERRUPT_PIN);
+    Log.println(" (type rtc in the Serial Monitor for details). This message is shown once.");
+    logAlarmStatus();
+  }
+  if (minuteMissed) {
+    minuteFallbacks++;
+    rtc.clearAlarm(2);
+    Log.println("Minute update (alarm 2 didn't arrive)");
+    minuteWork();
+  }
+  if (tempMissed) {
+    rtc.clearAlarm(1);
+    updateDs18();
+    lastTempMinute = utc / 60;
+    Log.println(":55 update (alarm 1 didn't arrive)");
+    logTemperatures();
+    if (showTemp && !inSetupMode) showTemperature();
+  }
+}
+
+// ================= WI-FI WATCHDOG =================
+// Once a day, at 12:00 top-row time (just before the daily time sync), the clock checks it's still on the
+// Wi-Fi. If the router restarted and the connection is gone, it rejoins. If that fails it tries again every
+// WIFI_RETRY_MINUTES until it's back, then goes back to the daily check. Each attempt pauses the display for
+// up to ~10 seconds.
+// The same applies if the saved Wi-Fi couldn't be joined at start-up (e.g. after a power cut the router
+// came up slower than the clock) and the clock is running its setup network, except that it never switches
+// away while someone is connected to the setup network.
+#define WIFI_RETRY_MINUTES  60
+
+uint32_t nextWifiTry = 0;      // UTC time of the next reconnect attempt (0 = none pending)
+
+// Things to restart once the clock is (back) on the Wi-Fi.
+void wifiJoined() {
+  WiFi.noLowPowerMode();
+  server.begin();
+  logUdp.stop();
+  startNetLog();
+  restartMdns();
+  printWiFiStatus();
+  if (rtcOk && (ntpRetryAt != 0 || !timeValid)) {   // a sync was missed while offline
+    uint32_t utc = rtc.now().unixtime();
+    ntpRetryAt = (syncTimeFromNTP() == 0) ? 0 : utc + 3600UL;
+  }
+}
+
+bool tryJoinSavedWiFi() {
+  Log.print("Wi-Fi: trying to join ");
+  Log.println(owner.wifissid);
+  WiFi.disconnect();
+  WiFi.end();
+  WiFi.setHostname(CLOCK_HOSTNAME);
+  status = WiFi.begin(owner.wifissid, owner.Password);   // waits until joined or timed out (~10 s)
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Run on every minute alarm; only does anything at noon or when a retry is due.
+void checkWiFi() {
+  if (!owner.valid || !rtcOk) return;   // no saved Wi-Fi to rejoin
+  uint32_t utc = rtc.now().unixtime();
+  time_t localNow = tzMain.toLocal(utc);
+  bool noon = hour(localNow) == 12 && minute(localNow) == 0;
+  bool retryDue = nextWifiTry != 0 && utc >= nextWifiTry;
+  if (!noon && !retryDue) return;
+
+  if (inSetupMode) {
+    if (WiFi.status() == WL_AP_CONNECTED) {             // someone is using the setup page: leave it alone
+      nextWifiTry = utc + WIFI_RETRY_MINUTES * 60UL;
+      return;
+    }
+    if (tryJoinSavedWiFi()) {
+      inSetupMode = false;
+      nextWifiTry = 0;
+      Log.println("Wi-Fi: joined the saved network, setup network closed");
+      wifiJoined();
+    } else {
+      nextWifiTry = utc + WIFI_RETRY_MINUTES * 60UL;
+      startSetupAP();
+      Log.println("Wi-Fi: still can't join the saved network, setup network back on");
+    }
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (noon) Log.println("Wi-Fi: daily check ok");
+    nextWifiTry = 0;
+    return;
+  }
+
+  Log.print("Wi-Fi: connection lost (reason code ");
+  Log.print(WiFi.reasonCode());
+  Log.println("), rejoining");
+  if (tryJoinSavedWiFi()) {
+    nextWifiTry = 0;
+    Log.println("Wi-Fi: reconnected");
+    wifiJoined();
+  } else {
+    nextWifiTry = utc + WIFI_RETRY_MINUTES * 60UL;
+    Log.print("Wi-Fi: not back yet, next try in ");
+    Log.print(WIFI_RETRY_MINUTES);
+    Log.println(" min");
+  }
+}
+
+// ================= START-UP STATUS + WI-FI =================
+// Status colours on the top time display, e.g. debugoutput(0, 1, 0, 0, 0, 150, 0) = middle row green.
+// The bottom time, date and day displays are blanked at the same time.
+// Shown before the clock has a time to display; once it has, the time is drawn over it.
+void debugoutput(int top, int mid, int bottom, int dots, int R, int G, int B) {
+  Panel &P = panels[TIME_A_PANEL];
+  P.strip->setBrightness(150);
+  P.strip->clear();
+  for (int c = 0; c < P.numChars; c++)
+    for (int k = 0; k < P.ledsPerSeg; k++) {
+      if (top)    P.strip->setPixelColor(physLed(P, c, S7_TOP, k), R, G, B);
+      if (mid)    P.strip->setPixelColor(physLed(P, c, S7_MID, k), R, G, B);
+      if (bottom) P.strip->setPixelColor(physLed(P, c, S7_BOT, k), R, G, B);
+    }
+  if (dots)
+    for (int i = 0; i < P.numSep; i++) P.strip->setPixelColor(P.sepLed[i], R, G, B);
+  P.strip->show();
+
+  // Blank the other three displays so only the status shows (LEDs keep their last colours through a restart).
+  // Any display that has something to show (e.g. SET UP) is redrawn on the next frame.
+  for (int p = 0; p < NUM_PANELS; p++) {
+    if (p == TIME_A_PANEL) continue;
+    panels[p].strip->clear();
+    panels[p].strip->show();
+  }
+}
+
+void printWiFiStatus() {
+  Log.print("SSID: ");
+  Log.println(WiFi.SSID());
+  IPAddress ip = WiFi.localIP();
+  Log.print("IP Address: ");
+  Log.println(ip);
+  Log.print("To see the setup page, open a browser to http://");
+  Log.println(ip);
+}
+
+String validateSSID(Credentials owner) {
+  WiFi.setHostname(CLOCK_HOSTNAME);
+  status = WiFi.begin(owner.wifissid, owner.Password);
+  delay(10000);
+  Log.print("SSID: ");
+  Log.println(WiFi.SSID());
+  IPAddress ip = WiFi.localIP();
+  Log.print("IP Address: ");
+  Log.println(ip);
+  String LocalIP = String() + WiFi.localIP()[0] + "." + WiFi.localIP()[1] + "." + WiFi.localIP()[2] + "." + WiFi.localIP()[3];
+  long rssi = WiFi.RSSI();
+  Log.print("signal strength (RSSI):");
+  Log.print(rssi);
+  Log.println(" dBm");
+  return (LocalIP);
+}
+
+// Start sending the log to the computer named on the setup page (once the clock has joined the Wi-Fi).
+void startNetLog() {
+  Log.enabled = false;
+  if (owner.logHost[0] == 0 || owner.logPort == 0) return;
+  IPAddress ip;
+  if (!ip.fromString(owner.logHost) && WiFi.hostByName(owner.logHost, ip) != 1) {
+    Log.print("Network log: can't find ");
+    Log.println(owner.logHost);
+    return;
+  }
+  Log.host = ip;
+  Log.port = owner.logPort;
+  logUdp.begin(4211);
+  Log.enabled = true;
+  Log.print("Network log: sending to ");
+  Log.print(ip);
+  Log.print(":");
+  Log.println(owner.logPort);
+}
+
+// Start the clock's own "RainbowClockSetup" network so the setup page can be reached.
+void startSetupAP() {
+  inSetupMode = true;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    WiFi.disconnect();   // clear any half-finished join attempt first; the module won't start an AP from it
+    WiFi.end();          // (resets the module on older WiFiNINA versions; does nothing on newer ones)
+    delay(500);
+    status = WiFi.beginAP(ssid);
+    if (status == WL_AP_LISTENING) break;
+    Log.print("Setup network didn't start (status ");
+    Log.print(status);
+    Log.print("), attempt ");
+    Log.print(attempt);
+    Log.println(" of 3");
+  }
+  if (status != WL_AP_LISTENING) {
+    debugoutput(1, 0, 0, 0, 255, 75, 250);   // top row pink: setup network wouldn't start
+    Log.println("Could not start the setup network - restarting in 30 seconds to try again");
+    delay(30000);
+    NVIC_SystemReset();
+  }
+  delay(1000);
+  server.begin();
+  debugoutput(1, 0, 0, 0, 255, 255, 0);      // top row yellow: setup network running
+  Log.print("Setup network started: ");
+  Log.println(ssid);
+  printWiFiStatus();
+  setPanelText(DATE_PANEL, "SET");   // date display reads first
+  setPanelText(DAY_PANEL, "UP");
+  panels[DATE_PANEL].hideSep = true;
+}
+
+// "-1.5" -> -15, "2" -> 20, "0.25" -> 3: a number in tenths, rounded. (Saves pulling in atof, about 5 KB.)
+int parseTenths(const char *t) {
+  bool neg = false;
+  while (*t == ' ') t++;
+  if (*t == '-' || *t == '+') neg = (*t++ == '-');
+  long whole = 0;
+  while (isdigit(*t)) whole = whole * 10 + (*t++ - '0');
+  int tenths = 0;
+  if (*t == '.' || *t == ',') {
+    t++;
+    if (isdigit(*t)) tenths = *t++ - '0';
+    if (isdigit(*t) && *t >= '5') tenths++;   // round on the hundredths digit
+  }
+  long v = whole * 10 + tenths;
+  if (v > 30000) v = 30000;
+  return neg ? -v : v;
+}
+
+// One setting from the setup page. Values arrive URL-encoded and may be empty.
+void applySetting(const char *name, const char *raw) {
+  char val[120];
+  urlDecode(raw, val, sizeof(val));
+  Log.print(name);
+  Log.print(" = ");
+  Log.println(strcmp(name, "password") && strcmp(name, "mqttpass") ? val : "(hidden)");
+
+  if      (!strcmp(name, "ssid"))       setText(owner.wifissid, sizeof(owner.wifissid), val);
+  else if (!strcmp(name, "password"))   setText(owner.Password, sizeof(owner.Password), val);
+  else if (!strcmp(name, "myRange"))    setText(owner.brightness, sizeof(owner.brightness), val);
+  else if (!strcmp(name, "12hr"))       setText(owner.twelvehr, sizeof(owner.twelvehr), val);       // "off" is stored as "of"
+  else if (!strcmp(name, "ShowTemp"))   setText(owner.temp, sizeof(owner.temp), val);
+  else if (!strcmp(name, "TempUnits"))  setText(owner.tempUnits, sizeof(owner.tempUnits), val);
+  else if (!strcmp(name, "dateformat")) setText(owner.USDateFormat, sizeof(owner.USDateFormat), val);
+  else if (!strcmp(name, "dimmer"))     setText(owner.dimmer, sizeof(owner.dimmer), val);
+  else if (!strcmp(name, "fx")) {
+    uint32_t v = strtoul(val, NULL, 10) & allEffectsMask();
+    if (v) owner.fxMask = v;
+  }
+  else if (!strcmp(name, "fxfixed")) {
+    int v = atoi(val);
+    if (v >= -1 && v < NUM_STYLES) owner.fxFixed = v;
+  }
+  else if (!strcmp(name, "fxint")) {
+    int v = atoi(val);
+    if (v >= 0 && v < FX_PERIOD_COUNT) owner.fxInterval = v;
+  }
+  else if (!strcmp(name, "tz1off")) { int v = atoi(val); if (validOffset(v)) owner.tz1Offset = v; }
+  else if (!strcmp(name, "tz1dst")) { int v = atoi(val); if (v >= 0 && v < DST_RULE_COUNT) owner.tz1Dst = v; }
+  else if (!strcmp(name, "tz2off")) { int v = atoi(val); if (validOffset(v)) owner.tz2Offset = v; }
+  else if (!strcmp(name, "tz2dst")) { int v = atoi(val); if (v >= 0 && v < DST_RULE_COUNT) owner.tz2Dst = v; }
+  else if (!strcmp(name, "tempsensor")) owner.tempSensor = (atoi(val) == 1) ? 1 : 0;
+  else if (!strcmp(name, "tempoffset")) owner.tempOffset10 = constrain(parseTenths(val), -200, 200);
+  else if (!strcmp(name, "loghost"))    setText(owner.logHost, sizeof(owner.logHost), val);
+  else if (!strcmp(name, "logport"))    { long v = atol(val); owner.logPort = (v >= 1 && v <= 65535) ? v : 4210; }
+  else if (!strcmp(name, "mqtthost"))   setText(owner.mqttHost, sizeof(owner.mqttHost), val);
+  else if (!strcmp(name, "mqttport"))   { long v = atol(val); owner.mqttPort = (v >= 1 && v <= 65535) ? v : 1883; }
+  else if (!strcmp(name, "mqttuser"))   setText(owner.mqttUser, sizeof(owner.mqttUser), val);
+  else if (!strcmp(name, "mqttpass"))   setText(owner.mqttPass, sizeof(owner.mqttPass), val);
+}
+
+// The page sends every setting on one line: "mydata: /?ssid=...&password=...&...".
+void parseSettings(char *line) {
+  char *p = strchr(line, '?');
+  if (!p) return;
+  p++;
+  p[strcspn(p, "\r\n")] = 0;
+  while (*p) {
+    char *amp = strchr(p, '&');
+    if (amp) *amp = 0;
+    char *eq = strchr(p, '=');
+    if (eq) {
+      *eq = 0;
+      applySetting(p, eq + 1);
+    }
+    if (!amp) break;
+    p = amp + 1;
+  }
+}
+
+// The setup page URL-encodes what's typed ("My Network" arrives as "My%20Network"); this turns it back.
+void urlDecode(const char *src, char *dst, size_t size) {
+  size_t n = 0;
+  while (*src && n < size - 1) {
+    if (src[0] == '%' && isxdigit(src[1]) && isxdigit(src[2])) {
+      char hex[3] = {src[1], src[2], 0};
+      dst[n++] = (char)strtol(hex, NULL, 16);
+      src += 3;
+    } else {
+      dst[n++] = *src++;
+    }
+  }
+  dst[n] = 0;
+}
+
+// Print a saved value inside a value='...' attribute, so a name like "Raina's WiFi" can't break the page.
+void printAttr(WiFiClient &client, const char *s) {
+  for (; *s; s++) {
+    switch (*s) {
+      case '&':  client.print("&amp;");  break;
+      case '\'': client.print("&#39;");  break;
+      case '"':  client.print("&quot;"); break;
+      case '<':  client.print("&lt;");   break;
+      case '>':  client.print("&gt;");   break;
+      default:   client.print(*s);
+    }
+  }
+}
+
+// Temperature card extras: which sensor, the offset, and what each sensor reads right now (to help set the offset).
+void printTempSensorFields(WiFiClient &client) {
+  client.println("<label for='tempsensor'>Sensor</label>");
+  client.print("<div class='select'><select id='tempsensor'>");
+  client.print("<option value='0'>DS3231 (clock chip)</option>");
+  client.print("<option value='1'");
+  if (owner.tempSensor == 1) client.print(" selected='selected'");
+  client.print(">DS18B20 probe");
+  if (!ds18Found) client.print(" (not found)");
+  client.println("</option></select><span class='focus'></span></div>");
+
+  client.println("<label for='tempoffset'>Offset (in the units above)</label>");
+  client.print("<input id='tempoffset' type='number' step='0.1' min='-20' max='20' value='");
+  int o = owner.tempOffset10;
+  if (o < 0) client.print("-");
+  client.print(abs(o) / 10);
+  client.print(".");
+  client.print(abs(o) % 10);
+  client.println("'>");
+
+  const char *unit = tempInF ? "&deg;F" : "&deg;C";
+  client.print("<p class='hint'>Reading now, before the offset: DS3231 ");
+  if (rtcOk) { client.print(toShownUnits(rtc.getTemperature()), 1); client.print(unit); }
+  else client.print("not found");
+  client.print(", DS18B20 ");
+  if (ds18Found && !isnan(ds18LastC)) { client.print(toShownUnits(ds18LastC), 1); client.print(unit); }
+  else client.print("not found");
+  client.println(".</p>");
+}
+
+// Network log card: where to send a copy of the Serial Monitor output.
+void printNetLogCard(WiFiClient &client) {
+  client.println("<li class='a-log'><fieldset class='card'><legend>Network log</legend>");
+  client.println("<p class='hint'>Sends a copy of the Serial Monitor to another computer (UDP). Leave the address blank to turn it off.</p>");
+  client.println("<div class='pairs'><div>");
+  client.println("<label for='loghost'>Send to (IP address or name)</label>");
+  client.print("<input id='loghost' type='text' value='");
+  printAttr(client, owner.logHost);
+  client.println("' placeholder='e.g. 192.168.1.50'>");
+  client.println("</div><div class='narrow'>");
+  client.println("<label for='logport'>Port</label>");
+  client.print("<input id='logport' type='number' min='1' max='65535' value='");
+  client.print(owner.logPort);
+  client.println("'>");
+  client.println("</div></div>");
+  client.println("</fieldset></li>");
+}
+
+// Setup-page card: which effects to rotate through, and how often to change.
+// The ticked boxes are sent as one number (bit n = effect n+1) in the hidden "fx" field.
+void printEffectsCard(WiFiClient &client) {
+  client.println("<li class='a-fx'><fieldset class='card'><legend>Effects</legend>");
+  client.println("<div class='fxtop'>");
+  client.println("<div><label for='fxfixed'>Effect</label>");
+  client.print("<div class='select'><select id='fxfixed'>");
+  int fixedNow = currentFixedEffect();
+  client.print("<option value='-1'");
+  if (fixedNow < 0) client.print(" selected='selected'");
+  client.print(">Rotate through the ticked effects</option>");
+  for (int i = 0; i < NUM_STYLES; i++) {
+    client.print("<option value='"); client.print(i); client.print("'");
+    if (i == fixedNow) client.print(" selected='selected'");
+    client.print(">Always "); client.print(i + 1); client.print(". "); client.print(STYLE_NAMES[i]); client.print("</option>");
+  }
+  client.println("</select><span class='focus'></span></div></div>");
+  client.println("<div><label for='fxint'>Change effect</label>");
+  client.print("<div class='select'><select id='fxint'>");
+  for (uint8_t i = 0; i < FX_PERIOD_COUNT; i++) {
+    client.print("<option value='"); client.print(i); client.print("'");
+    if (i == owner.fxInterval) client.print(" selected='selected'");
+    client.print(">"); client.print(FX_PERIOD_NAMES[i]); client.print("</option>");
+  }
+  client.println("</select><span class='focus'></span></div></div>");
+  client.println("<div class='fxbtns'><button type='button' onclick='fxAll(true)'>All</button>");
+  client.println("<button type='button' onclick='fxAll(false)'>None</button></div>");
+  client.println("</div>");
+  client.println("<p class='hint'>When rotating, the ticked effects are shown in order, moving to the next one at each change.</p>");
+  client.println("<div class='fxgrid'>");
+  for (int i = 0; i < NUM_STYLES; i++) {
+    client.print("<label class='fxitem'><input type='checkbox' class='fxcb' data-n='"); client.print(i); client.print("'");
+    if (owner.fxMask & (1UL << i)) client.print(" checked");
+    client.print(">"); client.print(i + 1); client.print(". "); client.print(STYLE_NAMES[i]); client.println("</label>");
+  }
+  client.println("</div>");
+  client.print("<input type='hidden' id='fx' value='"); client.print(owner.fxMask); client.println("'>");
+  client.println("<p class='hint fxmsg' id='fxmsg'></p>");
+  client.println("</fieldset></li>");
+}
+
+void printEffectsScript(WiFiClient &client) {
+  // Show / Hide buttons next to the password boxes
+  client.println("function pwToggle(id,b){var i=document.getElementById(id);var show=i.type==='password';i.type=show?'text':'password';b.textContent=show?'Hide':'Show';}");
+  client.println("function fxUpdate(){var m=0;document.querySelectorAll('.fxcb').forEach(function(c){if(c.checked){m+=Math.pow(2,+c.getAttribute('data-n'));}});");
+  client.println("document.getElementById('fx').value=m;document.getElementById('fxmsg').textContent=m?'':'Tick at least one effect.';return m;}");
+  client.println("function fxAll(on){document.querySelectorAll('.fxcb').forEach(function(c){c.checked=on;});fxUpdate();}");
+  client.println("document.querySelectorAll('.fxcb').forEach(function(c){c.onchange=fxUpdate;});");
+}
+
+// ================= SETUP PAGE (web server) =================
+void handleWebClient() {
+  if (!inSetupMode && !server.status()) server.begin();
+  WiFiClient client = server.available();
+  if (client) {
+    bool currentLineIsBlank = true;
+    unsigned long clientStart = millis();
+    while (client.connected()) {
+      if (millis() - clientStart > 3000) {     // a browser that stops sending mustn't stall the clock
+        Log.println("Setup page: request timed out");
+        break;
+      }
+      if (client.available()) {
+        char c = client.read();
+        readString += c;
+
+        if (c == '\n' && currentLineIsBlank) {
+          String twelvehour = "";
+          if ((String)owner.twelvehr == "on") {
+            twelvehour = " selected='selected' ";
+          }
+          String ShowTempUnitsSetting = "";
+          if ((String)owner.tempUnits == "F") {
+            ShowTempUnitsSetting = " selected ";
+          }
+
+          String ShowTempSetting = "";
+          if ((String)owner.temp == "on") {
+            ShowTempSetting = " selected ";
+          }
+          String DimmerSetting = "";
+          if ((String)owner.dimmer == "of") {
+            DimmerSetting = " selected ";
+          }
+          String dateformat = "";
+          if ((String)owner.USDateFormat == "of") {
+            dateformat = " selected ";
+          }
+          Log.println(DimmerSetting);
+
+
+
+          client.println("HTTP/1.1 200 OK");
+          client.println("Content-Type: text/html");
+          client.println();
+          client.println("<HTML>");
+          client.println("<HEAD>");
+          client.println("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+          client.println("<TITLE>Rainbow Clock Setup</TITLE>");
+          client.println("<meta http-equiv='Cache-Control' content='no-cache, no-store, must-revalidate' />");
+          client.println("<meta http-equiv='Pragma' content='no-cache' />");
+          client.println("<meta http-equiv='Expires' content='0' />");
+          client.println("</HEAD>");
+          client.println("<BODY>");
+          client.println("<style type='text/css'>");
+          client.println("*,");
+          client.println("*::before,");
+          client.println("*::after {");
+          client.println("box-sizing: border-box;");
+          client.println("}");
+          client.println(":root {");
+          client.println("--select-border: #777;");
+          client.println("--select-focus: blue;");
+          client.println("--select-arrow: var(--select-border);");
+          client.println("}");
+          client.print(".loader_website {");
+          client.print("position: fixed;");
+          client.print("top: 0;");
+          client.print("left: 0px;");
+          client.print("z-index: 1100;");
+          client.print("width: 100%;");
+          client.print("height: 100%;");
+          client.print("background-color: rgba(0, 0, 0, 0.5);");
+          client.print("display: block;");
+          client.print("-webkit-transition: ease-in-out 0.1s;");
+          client.print("-moz-transition: ease-in-out 0.1s;");
+          client.print("-o-transition: ease-in-out 0.1s;");
+          client.print("-ms-transition: ease-in-out 0.1s;");
+          client.print("transition: ease-in-out 0.1s;");
+          client.print("-webkit-box-sizing: border-box;");
+          client.print("-moz-box-sizing: border-box;");
+          client.print("-o-box-sizing: border-box;");
+          client.print("-ms-box-sizing: border-box;");
+          client.print("box-sizing: border-box;");
+          client.print("}");
+          client.print(".loader_website * {");
+          client.print("-webkit-box-sizing: border-box;");
+          client.print("-moz-box-sizing: border-box;");
+          client.print("-o-box-sizing: border-box;");
+          client.print("-ms-box-sizing: border-box;");
+          client.print("box-sizing: border-box;");
+          client.print("}");
+          client.print("body.loader .loader_website span {");
+          client.print("top: 18%;");
+          client.print("}");
+          client.print(".loader_website > span {");
+          client.print("display: block;");
+          client.print("width: 48px;");
+          client.print("height: 48px;");
+          client.print("padding: 4px;");
+          client.print("background-color: #ffffff;");
+          client.print("-webkit-border-radius: 100%;");
+          client.print("-moz-border-radius: 100%;");
+          client.print("-o-border-radius: 100%;");
+          client.print("-ms-border-radius: 100%;");
+          client.print("border-radius: 100%;");
+          client.print("position: absolute;");
+          client.print("left: 50%;");
+          client.print("margin-left: -24px;");
+          client.print("top: -50px;");
+          client.print("-webkit-transition: ease-in-out 0.1s;");
+          client.print("-moz-transition: ease-in-out 0.1s;");
+          client.print("-o-transition: ease-in-out 0.1s;");
+          client.print("-ms-transition: ease-in-out 0.1s;");
+          client.print("transition: ease-in-out 0.1s;");
+          client.print("-webkit-box-shadow: #000 0px 5px 10px -5px;");
+          client.print("-moz-box-shadow: #000 0px 5px 10px -5px;");
+          client.print("-o-box-shadow: #000 0px 5px 10px -5px;");
+          client.print("-ms-box-shadow: #000 0px 5px 10px -5px;");
+          client.print("box-shadow: #000 0px 5px 10px -5px;");
+          client.print("}");
+          client.print(".loader_website > span > svg {");
+          client.print("fill: transparent;");
+          client.print("stroke: #563d7c;");
+          client.print("stroke-width: 5;");
+          client.print("animation: loader_dash 2s ease infinite, loader_rotate 2s linear infinite;");
+          client.print("}");
+          client.print("@keyframes loader_dash {");
+          client.print("0% {");
+          client.print("stroke-dasharray: 1, 95;");
+          client.print("stroke-dashoffset: 0;");
+          client.print("}");
+          client.print("50% {");
+          client.print("stroke-dasharray: 85, 95;");
+          client.print("stroke-dashoffset: -25;");
+          client.print("}");
+          client.print("100% {");
+          client.print("stroke-dasharray: 85, 95;");
+          client.print("stroke-dashoffset: -93;");
+          client.print("}");
+          client.print("}");
+          client.print("@keyframes loader_rotate {");
+          client.print("0% {");
+          client.print("transform: rotate(0deg);");
+          client.print("}");
+          client.print("100% {");
+          client.print("transform: rotate(360deg);");
+          client.print("}");
+          client.print("}");
+          client.println("select {");
+          client.println("color: black;");
+          client.println("-webkit-appearance: none;");
+          client.println("-moz-appearance: none;");
+          client.println("appearance: none;");
+          client.println("background-color: transparent;");
+          client.println("border: none;");
+          client.println("padding: 0 1em 0 0;");
+          client.println("margin: 0;");
+          client.println("width: 100%;");
+          client.println("font-family: inherit;");
+          client.println("font-size: inherit;");
+          client.println("cursor: inherit;");
+          client.println("line-height: inherit;");
+          client.println("z-index: 1;");
+          client.println("outline: none;");
+          client.println("}");
+          client.println("select::-ms-expand {");
+          client.println("display: none;");
+          client.println("}");
+          client.println(".select {");
+          client.println("color: black;");
+          client.println("display: grid;");
+          client.println("grid-template-areas: 'select';");
+          client.println("align-items: center;");
+          client.println("position: relative;");
+          client.println("min-width: 15ch;");
+          client.println("max-width: 30ch;");
+          client.println("border: 1px solid var(--select-border);");
+          client.println("border-radius: 0.25em;");
+          client.println("padding: 0.25em 0.5em;");
+          client.println("font-size: 1.25rem;");
+          client.println("cursor: pointer;");
+          client.println("line-height: 1.1;");
+          client.println("background-color: #fff;");
+          client.println("background-image: linear-gradient(to top, #f9f9f9, #fff 33%);");
+          client.println("}");
+          client.println(".select select, .select::after {");
+          client.println("grid-area: select;");
+          client.println("}");
+          client.println(".select:not(.select--multiple)::after {");
+          client.println("content: '';");
+          client.println("justify-self: end;");
+          client.println("width: 0.8em;");
+          client.println("height: 0.5em;");
+          client.println("background-color: var(--select-arrow);");
+          client.println("-webkit-clip-path: polygon(100% 0%, 0 0%, 50% 100%);");
+          client.println("clip-path: polygon(100% 0%, 0 0%, 50% 100%);");
+          client.println("}");
+          client.println("select:focus + .focus {");
+          client.println("position: absolute;");
+          client.println("top: -1px;");
+          client.println("left: -1px;");
+          client.println("right: -1px;");
+          client.println("bottom: -1px;");
+          client.println("border: 2px solid var(--select-focus);");
+          client.println("border-radius: inherit;");
+          client.println("}");
+          client.println("select[multiple] {");
+          client.println("height: 6rem;");
+          client.println("}");
+          client.println("select[multiple] option {");
+          client.println("white-space: normal;");
+          client.println("outline-color: var(--select-focus);");
+          client.println("}");
+          client.println(".select--disabled {");
+          client.println("cursor: not-allowed;");
+          client.println("background-color: #eee;");
+          client.println("background-image: linear-gradient(to top, #ddd, #eee 33%);");
+          client.println("}");
+          client.println("label {");
+          client.println("font-size: 1.125rem;");
+          client.println("font-weight: 500;");
+          client.println("}");
+          client.println(".select + label {");
+          client.println("margin-top: 2rem;");
+          client.println("}");
+          client.println("body {");
+          client.println("min-height: 100vh;");
+          client.println("display: grid;");
+          client.println("place-content: center;");
+          client.println("grid-gap: 0.5rem;");
+          client.println("font-family: 'Baloo 2', sans-serif;");
+          client.println("/*background-color: #e9f2fd;*/");
+          client.println("padding: 1rem;");
+          client.println("}");
+
+          client.println(".formcontent label {");
+          client.println("/*color: red;*/");
+          client.println("display: block;");
+          client.println("}");
+
+          client.println(".formcontent {");
+          client.println("text-align: center;");
+          client.println("width: 30ch;");
+          client.println("margin: 0 auto;");
+          client.println("}");
+
+          client.println(".formcontent li {");
+          client.println("list-style: none;");
+          client.println("padding-top: 10px;");
+          client.println("width: 30ch;");
+          client.println("}");
+
+          client.println(".formcontent input {");
+          client.println("color: black;");
+          client.println("display: grid;");
+          client.println("grid-template-areas: 'select';");
+          client.println("align-items: center;");
+          client.println("position: relative;");
+          client.println("min-width: 15ch;");
+          client.println("max-width: 24ch;");
+          client.println("border: 1px solid var(--select-border);");
+          client.println("border-radius: 0.25em;");
+          client.println("padding: 0.25em 0.5em;");
+          client.println("font-size: 1.25rem;");
+          client.println("cursor: pointer;");
+          client.println("line-height: 1.1;");
+          client.println("background-color: #fff;");
+          client.println("text-align: center;");
+          client.println("background-image: linear-gradient(to top, #f9f9f9, #fff 33%);");
+          client.println("}");
+
+          client.println(".formcontent button {");
+          client.println("color: black;");
+          client.println("display: grid;");
+          client.println("grid-template-areas: 'select';");
+          client.println("align-items: center;");
+          client.println("position: relative;");
+          client.println("min-width: 15ch;");
+          client.println("max-width: 24ch;");
+          client.println("border: 1px solid var(--select-border);");
+          client.println("border-radius: 0.25em;");
+          client.println("padding: 0.25em 0.5em;");
+          client.println("font-size: 1.25rem;");
+          client.println("cursor: pointer;");
+          client.println("line-height: 1.1;");
+          client.println("background-color: #fff;");
+          client.println("text-align: center;");
+          client.println("background-image: linear-gradient(to top, #f9f9f9, #fff 33%);");
+          client.println("}");
+
+          // The moving rainbow sits on a layer pinned to the screen; the cards scroll over it. (A page-sized
+          // background repeated with a hard edge on long pages, and phones ignore background-attachment: fixed.)
+          client.println("html {scrollbar-gutter: stable;}");   // keep room for the scrollbar so the layout doesn't shift
+          client.println("html::before {");
+          client.println("content: ''; position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: -1;");
+          client.println("background: linear-gradient(145deg,");
+          client.println("rgba(43, 9, 82, 1) 9%,");
+          client.println("rgba(2, 2, 255, 1) 18%,");
+          client.println("rgba(2, 255, 2, 1) 27%,");
+          client.println("rgba(196, 181, 0, 1) 36%,");
+          client.println("rgba(255, 165, 0, 1) 45%,");
+          client.println("rgba(162, 19, 19, 1) 63%,");
+          client.println("rgba(255, 165, 0, 1) 72%,");
+          client.println("rgba(196, 181, 0, 1) 81%,");
+          client.println("rgba(2, 255, 2, 1) 90%,");
+          client.println("rgba(2, 2, 255, 1) 99%,");
+          client.println("rgba(43, 9, 82, 1) 100%);");
+
+          client.println("background-size: 400% 400%;");
+          client.println("animation: gradient 5s ease infinite;");
+
+          client.println("}");
+
+          client.println("@keyframes gradient {");
+          client.println("0% {");
+          client.println("background-position: 0% 50%;");
+          client.println("}");
+          client.println("50% {");
+          client.println("background-position: 100% 50%;");
+          client.println("}");
+          client.println("100% {");
+          client.println("background-position: 0% 50%;");
+          client.println("}");
+          client.println("}");
+
+          client.println(".loader {");
+          client.println("border: 16px solid #f3f3f3; /* Light grey */");
+          client.println("border-style: solid;");
+          client.println("border-width: 0px;");
+
+          client.println("}");
+
+          client.println("@keyframes spin {");
+          client.println("0% {");
+          client.println("transform: rotate(0deg);");
+          client.println("}");
+          client.println("100% {");
+          client.println("transform: rotate(360deg);");
+          client.println("}");
+          client.println("}");
+
+          client.println(".slidecontainer {width: 100%;}");
+
+          client.println(".slider {-webkit-appearance: none;width: 100%;height: 25px;background: #d3d3d3;outline: none;opacity: 0.7;-webkit-transition: .2s;transition: opacity .2s;}");
+
+          client.println(".slider:hover {opacity: 1;}");
+
+          client.println(".slider::-webkit-slider-thumb {-webkit-appearance: none;appearance: none;width: 25px;height: 25px;background: #04AA6D;cursor: pointer;}");
+
+          client.println(".slider::-moz-range-thumb {width: 25px;height: 25px;background: #04AA6D;cursor: pointer;}");
+          client.println(".slider:disabled::-webkit-slider-thumb{background: grey;cursor: not-allowed !important;}");
+          client.println(".slider:disabled::-moz-range-thumb{background: grey;cursor: not-allowed !important;}");
+          client.println(".slider:disabled{cursor: not-allowed !important;}");
+
+          // ---- responsive card layout ----
+          client.println("body {display: block; place-content: normal;}");
+          client.println(".formcontent {width: 100%; max-width: 1200px; margin: 0 auto;}");
+          client.println(".cards {display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; padding: 0; margin: 0; align-items: stretch;}");
+          // Cards stack top-to-bottom inside their slot and always take its full width, so anything a browser
+          // extension adds next to them (e.g. a password manager's icons) can't squeeze them narrower.
+          client.println(".cards > li {width: auto; padding-top: 0; display: flex; flex-direction: column; align-items: stretch;}");
+          client.println(".cards > li > .card {flex: 1 1 auto;}");
+          client.println(".cards > li.a-title, .cards > li.a-save {align-items: center;}");
+          client.println(".a-title h3 {background-color: rgba(255, 255, 255, 0.35); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); border: 1px solid rgba(255, 255, 255, 0.6); border-radius: 0.5em; padding: 0.4em 1em; margin: 0;}");
+          client.println(".a-save button {width: 16rem; max-width: 100%; margin: 0 auto; display: block;}");
+          client.println(".card {margin: 0; border: 1px solid var(--select-border); border-radius: 0.5em; padding: 0.5em 0.9em 0.9em; background-color: rgba(255, 255, 255, 0.3); border-color: rgba(255, 255, 255, 0.6); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12); min-width: 0;}");
+          client.println(".card legend {font-weight: 700; padding: 0.1em 0.6em; background-color: rgba(255, 255, 255, 0.7); border-radius: 0.25em; border: 1px solid rgba(255, 255, 255, 0.8);}");
+          client.println(".card label {margin: 0.6em 0 0.2em;}");
+          client.println(".card .select {max-width: none; min-width: 0;}");
+          client.println(".card input:not(.slider) {max-width: none; min-width: 0; width: 100%;}");
+          client.println(".card .hint {font-size: 0.85rem; margin: 0.2em 0 0;}");
+          client.println(".pairs {display: flex; flex-wrap: wrap; gap: 0 1em;}");
+          client.println(".pwwrap {display: flex; gap: 0.4em; align-items: stretch;}");
+          client.println(".pwwrap input {flex: 1 1 auto; min-width: 0;}");
+          client.println(".formcontent .pwwrap button.pwbtn {flex: 0 0 auto; min-width: 4.5em; max-width: none; display: block; font-size: 1rem; padding: 0 0.6em;}");
+          client.println(".pairs > div {flex: 1 1 14rem; min-width: 0;}");
+          client.println(".pairs > div.narrow {flex: 0 1 8rem;}");
+          client.println(".card input.slider {max-width: none; min-width: 0; width: 100%; display: block;}");
+          client.println("@media (min-width: 640px) {");
+          client.println(".cards {grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-areas: 'title title' 'wifi mqtt' 'display temp' 'tz1 tz2' 'fx fx' 'log log' 'save save';}");
+          client.println("}");
+          client.println("@media (min-width: 1200px) {");
+          client.println(".cards {grid-template-columns: repeat(4, minmax(0, 1fr)); grid-template-areas: 'title title title title' 'wifi wifi mqtt mqtt' 'display temp tz1 tz2' 'fx fx fx fx' 'log log log log' 'save save save save';}");
+          client.println("}");
+          client.println("@media (min-width: 640px) {");
+          client.println(".a-title {grid-area: title;} .a-wifi {grid-area: wifi;} .a-display {grid-area: display;} .a-temp {grid-area: temp;}");
+          client.println(".a-tz1 {grid-area: tz1;} .a-tz2 {grid-area: tz2;} .a-fx {grid-area: fx;} .a-log {grid-area: log;} .a-mqtt {grid-area: mqtt;} .a-save {grid-area: save;}");
+          client.println("}");
+          // effects card
+          client.println(".fxtop {display: flex; flex-wrap: wrap; gap: 0.5em 1em; align-items: flex-end; justify-content: center;}");
+          client.println(".fxtop > div {flex: 0 1 18rem;}");
+          client.println(".fxbtns {display: flex; gap: 0.5em;}");
+          client.println(".formcontent .fxbtns button {min-width: 0; font-size: 1rem; display: block; flex: 1;}");
+          client.println(".fxgrid {display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: 0.15em 1em; text-align: left; margin-top: 0.8em;}");
+          client.println(".card label.fxitem {display: flex; align-items: center; gap: 0.5em; margin: 0; font-size: 1rem; font-weight: 400; cursor: pointer;}");
+          client.println(".card input.fxcb {width: 1.15em; height: 1.15em; min-width: 0; max-width: none; padding: 0; margin: 0; display: inline-block; flex: none; cursor: pointer;}");
+          client.println(".card .fxmsg {color: #a00; font-weight: 700; min-height: 1.2em;}");
+          client.println("</style>");
+
+          client.println("<header class='container-col'>");
+
+          client.println("</header>");
+          ////  client.print("<form method='get' action=''>");
+          //  client.println("<form onsubmit='return false'>");
+          // Settings are laid out as cards.  The grid shows 1 column on a phone, 2 on a tablet / small laptop and
+          // 4 on a wide screen (see the .cards rules in the style block).  The two clock cards always sit together.
+          client.println("<div class='formcontent'>");
+          client.println("<ul class='cards'>");
+          client.println("<li class='a-title'><h3>Rainbow Clock Setup</h3></li>");
+
+          client.println("<li class='a-wifi'><fieldset class='card'><legend>Wi-Fi</legend>");
+          client.println("<label for='ssid'>Network name (SSID)</label>");
+          client.print("<input id='ssid' required type='text' name='ssid' value='");
+          printAttr(client, owner.wifissid);
+          client.println("' placeholder='ssid'>");
+          client.println("<label for='password'>Password</label>");
+          client.print("<div class='pwwrap'><input id='password' type='password' name='password' value='");
+          printAttr(client, owner.Password);
+          client.println("' placeholder='password' required>");
+          client.println("<button type='button' class='pwbtn' onclick=\"pwToggle('password', this)\">Show</button></div>");
+          client.println("</fieldset></li>");
+          printMqttCard(client);
+
+          client.println("<li class='a-display'><fieldset class='card'><legend>Display</legend>");
+          client.println("<label for='12hr'>Show 12hr Time</label>");
+          client.print("<div class='select'><select name='12hr' id='12hr'>");
+          client.print("<option value='off'>off</option>");
+          client.print("<option value='on' ");
+          client.print(twelvehour);
+          client.println(">on</option></select><span class='focus'></span></div>");
+          client.println("<label for='dateformat'>Date Format</label>");
+          client.print("<div class='select'><select name='dateformat' id='dateformat'>");
+          client.print("<option value='on'>mm-dd</option>");
+          client.print("<option value='off' ");
+          client.print(dateformat);
+          client.println(">dd-mm</option></select><span class='focus'></span></div>");
+          client.println("<label for='dimmer'>Enable Auto Dimming</label>");
+          client.print("<div class='select'><select name='dimmer' id='dimmer'>");
+          client.print("<option value='on'>on</option>");
+          client.print("<option value='off' ");
+          client.print(DimmerSetting);
+          client.println(">off</option></select><span class='focus'></span></div>");
+          client.println("<label for='myRange'>Display Brightness</label>");
+          client.println("<div class='slidecontainer'>");
+          String Brightnesslevel = (String)owner.brightness;
+          Brightnesslevel.trim();
+          client.print("<input type='range' name='range' min='1' max='255' value='");
+          client.print(Brightnesslevel);
+          client.println("' class='slider' id='myRange'>");
+          client.print("<input type='hidden' name='rangevalue' value='");
+          client.print(Brightnesslevel);
+          client.println("' id='rangevalue'>");
+          client.println("</div>");
+          client.println("</fieldset></li>");
+
+          client.println("<li class='a-temp'><fieldset class='card'><legend>Temperature</legend>");
+          client.println("<label for='ShowTemp'>Show every minute</label>");
+          client.print("<div class='select'><select name='ShowTemp' id='ShowTemp'>");
+          client.print("<option value='off'>off</option>");
+          client.print("<option value='on' ");
+          client.print(ShowTempSetting);
+          client.println(">on</option></select><span class='focus'></span></div>");
+          client.println("<label for='TempUnits'>Units</label>");
+          client.print("<div class='select'><select name='TempUnits' id='TempUnits'>");
+          client.print("<option value='C'>C</option>");
+          client.print("<option value='F' ");
+          client.print(ShowTempUnitsSetting);
+          client.println(">F</option></select><span class='focus'></span></div>");
+          printTempSensorFields(client);
+          client.println("</fieldset></li>");
+
+          printZoneFields(client, 1, "Top row clock", "Also sets the date.", owner.tz1Offset, owner.tz1Dst);
+          printZoneFields(client, 2, "Bottom row clock", "", owner.tz2Offset, owner.tz2Dst);
+
+          printEffectsCard(client);
+          printNetLogCard(client);
+
+          client.println("<li class='a-save'><button id='Submit' name='Submit' value='Submit' onclick='submit();'>Save</button></li>");
+          client.println("</ul>");
+          client.println("</div>");
+          //  client.println("</form>");
+          client.println("<script>");
+
+          client.println("if (document.getElementById('dimmer').value === 'off') {");
+          client.println("document.getElementById('myRange').removeAttribute('disabled');");
+          client.println("} else {");
+          client.println("document.getElementById('myRange').setAttribute('disabled', 'disabled');");
+          client.println("}");
+          client.println("document.getElementById('dimmer').onchange = function () {");
+          client.println("document.getElementById('myRange').setAttribute('disabled', 'disabled');");
+          client.println("if (this.value == 'off') {");
+          client.println("document.getElementById('myRange').removeAttribute('disabled');");
+          client.println("}");
+          client.println("};");
+
+          client.println("var slider = document.getElementById('myRange');");
+          client.println("var output = document.getElementById('rangevalue');");
+          client.println("output.value = slider.value;");
+
+          client.println("slider.oninput = function() {");
+          client.println("  output.value = this.value;");
+          client.println("  slider.value = this.value;");
+          client.println("}");
+          client.print("var Loader = {");
+          client.print("loader: null,");
+          client.print("body: null,");
+          client.print("html: '<span><svg width=\\'40\\' height=\\'40\\' version=\\'1.1\\' xmlns=\\'http://www.w3.org/2000/svg\\'><circle cx=\\'20\\' cy=\\'20\\' r=\\'15\\'></svg></span>',");
+          client.print("cssClass: 'loader',");
+          client.print("check: function () {");
+          client.print("if (this.body == null) {");
+          client.print("this.body = document.getElementsByTagName('body')[0];");
+          client.print("}");
+          client.print("},");
+          client.print("open: function () {");
+          client.print("this.check();");
+          client.print("if (!this.isOpen()) {");
+          client.print("this.loader = document.createElement('div');");
+          client.print("this.loader.setAttribute('id', 'loader');");
+          client.print("this.loader.classList.add('loader_website');");
+          client.print("this.loader.innerHTML = this.html;");
+          client.print("this.body.appendChild(this.loader);");
+          client.print("setTimeout(function () {");
+          client.print("Loader.body.classList.add(Loader.cssClass);");
+          client.print("}, 1);");
+          client.print("}");
+          client.print("return this;");
+          client.print("},");
+          client.print("close: function () {");
+          client.print("this.check();");
+          client.print("if (this.isOpen()) {");
+          client.print("this.body.classList.remove(this.cssClass);");
+          client.print("setTimeout(function () {");
+          client.print("Loader.loader.remove();");
+          client.print("}, 100);");
+          client.print("}");
+          client.print("return this;");
+          client.print("},");
+          client.print("isOpen: function () {");
+          client.print("this.check();");
+          client.print("return this.body.classList.contains(this.cssClass);");
+          client.print("},");
+          client.print("ifOpened: function (callback, close) {");
+          client.print("this.check();");
+          client.print("if (this.isOpen()) {");
+          client.print("if (!!close)");
+          client.print("this.close();");
+          client.print("if (typeof callback === 'function') {");
+          client.print("callback();");
+          client.print("}");
+          client.print("}");
+          client.print("return this;");
+          client.print("},");
+          client.print("ifClosed: function (callback, open) {");
+          client.print("this.check();");
+          client.print("if (!this.isOpen()) {");
+          client.print("if (!!open)");
+          client.print("this.open();");
+          client.print("if (typeof callback === 'function') {");
+          client.print("callback();");
+          client.print("}");
+          client.print("}");
+          client.print("return this;");
+          client.print("}");
+          client.print("};");
+          printEffectsScript(client);
+          client.println("function submit() {");
+          client.println("Loader.open();");
+          client.println("var FormValid = true;");
+          client.println("var data = [];");
+          client.println("if (!fxUpdate()) { FormValid = false; }");
+
+          client.println(" const container = document.querySelector('div.formcontent');");
+          client.println(" container.querySelectorAll('input').forEach(function (e) {");
+          client.println("  if (e.type === 'checkbox') { return; }");
+          client.println("  if (e.validity.valueMissing) {");
+          client.println("    FormValid = false;");
+          client.println(";  }");
+
+          client.println("  data[e.id] = e.value;");
+
+          client.println("});");
+          client.println("container.querySelectorAll('select').forEach(function (e) {");
+          client.println("data[e.id] = e.value;");
+
+          client.println("});");
+
+          client.println("encodeDataToURL = (data) => {");
+          client.println("return Object");
+          client.println(".keys(data)");
+          client.println(".map(value => `${value}=${encodeURIComponent(data[value])}`)");
+          client.println(".join('&');");
+          client.println("}");
+
+          // console.log(encodeDataToURL(data));
+          client.println("var mypost = encodeDataToURL(data)");
+          client.println("mypost = mypost + '&Submit=Submit'");
+          // console.log(mypost);
+          client.println("if (FormValid) {");
+          client.println("var request = new XMLHttpRequest();");
+          client.println("request.open('GET', '/', true);");
+          client.println("request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');");
+          client.println("request.setRequestHeader('mydata','/?'+encodeDataToURL(data));");
+          client.println("request.onreadystatechange = function () {");
+          client.println("if (this.readyState == XMLHttpRequest.DONE && this.status == 200) {");
+          client.println("console.log('succeed');");
+          client.print("Loader.close()");
+          // client.println("el.classList.add('hidden');");
+          //   myresponse.value = request.responseText;
+          client.println("} else {");
+          client.println("console.log('server error');");
+          client.print("Loader.close()");
+
+          client.println("}");
+          client.println("};");
+
+          client.println("request.onerror = function () {");
+          client.println("console.log('something went wrong');");
+          client.print("Loader.close()");
+          client.println("};");
+
+          client.println("request.send(mypost);");
+          client.println("} else { Loader.close(); }");
+          client.println("}");
+          //          client.println("           </script>");
+
+          client.println("</script>");
+          client.println("</BODY>");
+          client.println("</HTML>");
+          break;
+        }
+        if (c == '\n') {
+          Log.println(readString);
+          if (readString.indexOf("ssid") > 0) {
+            debugoutput(1, 0, 0, 0, 150, 0, 150);
+            // Log.println(readString);
+            char Buf[1536];  // room for long names and passwords even after URL-encoding
+            readString.toCharArray(Buf, sizeof(Buf));
+            parseSettings(Buf);
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-Type: text/html");
+            client.println();
+            Log.println("Starting Wifi Check");
+
+            String returnedip = validateSSID(owner);
+            if (returnedip == "0.0.0.0") {
+              Log.println("Wifi Failed");
+              debugoutput(1, 0, 1, 0, 255, 0, 0);
+              startSetupAP();
+            } else {  // connection successful.  Top and bottow rows blue.
+              WiFi.setHostname(CLOCK_HOSTNAME);
+              status = WiFi.begin(owner.wifissid, owner.Password);
+              debugoutput(1, 0, 1, 0, 0, 0, 255);
+              owner.valid = true;
+              owner.settingsMagic = SETTINGS_MAGIC;
+              Log.println("Saving Data");
+              my_flash_store.write(owner);
+              delay(2000);
+              NVIC_SystemReset();   // restart so the new settings take effect
+              Log.println("Restarting Server");
+              //              owner2 = my_flash_store.read();
+              //              Log.println((String)owner2.temp);
+              //              Log.println((String)owner2.valid);
+            }
+          }
+
+          readString = "";
+          // you're starting a new line
+
+          currentLineIsBlank = true;
+        } else if (c != '\r') {
+          // you've gotten a character on the current line
+          // Log.println("b");
+          currentLineIsBlank = false;
+        }
+      }
+    }
+
+    delay(1);
+    client.stop();
+
+
+  } else {
+    // Log.println ("Client is false");
+  }
+}
+
+// ================= MESSAGES (from Home Assistant, or "msg" in the Serial Monitor) =================
+// The date and day displays read as one 7-character line, date first. Up to 7 characters stay still;
+// longer text scrolls (after a short pause at the start). After owner.msgSeconds the normal date and day return.
+#define MSG_SCROLL_MS   350       // time per scroll step
+#define MSG_START_MS    1500      // pause before a long message starts scrolling
+#define MSG_GAP         3         // blank characters between the end of a scrolling message and its start
+
+char msgText[65] = "";
+bool msgActive = false;
+unsigned long msgEndAt = 0, msgStepAt = 0;
+int msgPos = 0;
+bool msgStateDirty = false;       // tells MQTT to publish the message state
+
+void drawMessageWindow() {
+  int len = strlen(msgText);
+  char win[7];
+  for (int i = 0; i < 7; i++) {
+    if (len <= 7) {
+      win[i] = i < len ? msgText[i] : ' ';
+    } else {
+      int k = (msgPos + i) % (len + MSG_GAP);
+      win[i] = k < len ? msgText[k] : ' ';
+    }
+  }
+  char date[5] = {win[0], win[1], win[2], win[3], 0};
+  char day[4] = {win[4], win[5], win[6], 0};
+  writePanelText(panels[DATE_PANEL], date);
+  writePanelText(panels[DAY_PANEL], day);
+}
+
+void endMessage() {
+  msgActive = false;
+  msgText[0] = 0;
+  msgStateDirty = true;
+  panels[DATE_PANEL].manual = false;
+  panels[DAY_PANEL].manual = false;
+  panels[DATE_PANEL].fadeMs = 0;
+  panels[DAY_PANEL].fadeMs = 0;
+  panels[DATE_PANEL].hideSep = false;
+  writePanelText(panels[DATE_PANEL], "");
+  writePanelText(panels[DAY_PANEL], "");
+  if (inSetupMode) {
+    setPanelText(DATE_PANEL, "SET");
+    setPanelText(DAY_PANEL, "UP");
+  }
+  drawClock();   // date and day back (if the time is known)
+}
+
+// Show text for "seconds" (a long message always gets at least one full pass). Empty text clears it.
+void showMessage(const char *text, unsigned long seconds) {
+  while (*text == ' ') text++;
+  if (!*text) {
+    if (msgActive) {
+      Log.println("Message cleared");
+      endMessage();
+    }
+    return;
+  }
+  setText(msgText, sizeof(msgText), text);
+  int len = strlen(msgText);
+  unsigned long ms = seconds * 1000UL;
+  if (len > 7) {
+    unsigned long onePass = MSG_START_MS + (unsigned long)(len + MSG_GAP) * MSG_SCROLL_MS;
+    if (ms < onePass) ms = onePass;
+  }
+  msgActive = true;
+  msgStateDirty = true;
+  msgPos = 0;
+  msgEndAt = millis() + ms;
+  msgStepAt = millis() + MSG_START_MS;
+  panels[DATE_PANEL].manual = true;
+  panels[DAY_PANEL].manual = true;
+  panels[DATE_PANEL].hideSep = true;
+  panels[DATE_PANEL].fadeMs = (len > 7) ? 120 : 0;   // quick fades so scrolling text stays readable
+  panels[DAY_PANEL].fadeMs = (len > 7) ? 120 : 0;
+  drawMessageWindow();
+  Log.print("Message: ");
+  Log.println(msgText);
+}
+
+void serialMessage(const char *text) {
+  showMessage(text, owner.msgSeconds);
+}
+
+void updateMessage() {
+  if (!msgActive) return;
+  if ((long)(millis() - msgEndAt) >= 0) {
+    endMessage();
+    return;
+  }
+  int len = strlen(msgText);
+  if (len > 7 && (long)(millis() - msgStepAt) >= 0) {
+    msgPos = (msgPos + 1) % (len + MSG_GAP);
+    msgStepAt = millis() + MSG_SCROLL_MS;
+    drawMessageWindow();
+  }
+}
+
+// ================= HOME ASSISTANT (MQTT) =================
+// With a broker set on the setup page, the clock connects to it and announces itself using Home Assistant's
+// MQTT discovery, so it shows up under Settings > Devices & services > MQTT as "Rainbow Clock" with:
+//   Effect (Rotate or one effect), Current effect, Effect change, Message, Message seconds, Brightness,
+//   Auto dimming, Temperature, Wi-Fi signal, Restart, and online/offline status.
+// Changes made from Home Assistant last until the clock restarts (the setup page's settings apply at
+// start-up), so automations can change things often without wearing out the settings flash.
+// Topics: rainbowclock/<id>/<thing> for states and rainbowclock/<id>/<thing>/set for commands.
+#define MQTT_RETRY_MS     120000UL   // if the broker can't be reached, try again this often
+#define MQTT_STATS_MS     60000UL    // how often temperature and Wi-Fi signal are sent
+
+WiFiClient mqttNet;
+MqttClient mqtt(mqttNet);
+String mqttId;                       // e.g. "rainbowclock_a1b2c3" (from the Wi-Fi MAC address)
+String mqttBase;                     // e.g. "rainbowclock/a1b2c3"
+unsigned long mqttLastTry = 0;
+bool mqttTried = false;
+bool mqttAnnounce = false;           // (re)send discovery + all states on the next loop
+
+// What was last sent, so only changes are published
+int pubStyle = -2;
+int pubAuto = -1;
+int pubInterval = -1;
+int pubBright = -1;
+int pubDimming = -1;
+int pubMsgSecs = -1;
+int pubUnsaved = -1;
+unsigned long pubStatsAt = 0;
+
+bool mqttEnabled() {
+  return owner.mqttHost[0] != 0;
+}
+
+bool mqttConnected() {
+  return mqtt.connected();
+}
+
+void mqttPublish(const String &topic, const String &payload, bool retain) {
+  mqtt.beginMessage(topic, payload.length(), retain, 0);
+  mqtt.print(payload);
+  mqtt.endMessage();
+}
+
+// One Home Assistant discovery message. "body" is the entity-specific part of the JSON.
+void mqttDiscover(const char *component, const char *object, const String &body) {
+  String topic = String("homeassistant/") + component + "/" + mqttId + "/" + object + "/config";
+  String json = "{\"~\":\"" + mqttBase + "\"," + body +
+                ",\"uniq_id\":\"" + mqttId + "_" + object + "\"" +
+                ",\"avty_t\":\"~/status\"" +
+                ",\"dev\":{\"ids\":[\"" + mqttId + "\"],\"name\":\"" + CLOCK_HOSTNAME + "\",\"mf\":\"DIY\",\"mdl\":\"Arduino MKR WiFi 1010\"" +
+                ",\"cu\":\"" + clockWebAddress() + "\"}}";      // "Visit" link on the device page
+  mqttPublish(topic, json, true);
+}
+
+String jsonList(const char *first, const char *const *items, int count) {
+  String s = "[";
+  if (first) s += String("\"") + first + "\"";
+  for (int i = 0; i < count; i++) {
+    if (s.length() > 1) s += ",";
+    s += String("\"") + items[i] + "\"";
+  }
+  return s + "]";
+}
+
+void mqttSendDiscovery() {
+  mqttDiscover("select", "effect",
+               "\"name\":\"Effect\",\"icon\":\"mdi:palette\",\"cmd_t\":\"~/effect/set\",\"stat_t\":\"~/effect\",\"ops\":" +
+               jsonList("Rotate", STYLE_NAMES, NUM_STYLES));
+  mqttDiscover("sensor", "current_effect",
+               "\"name\":\"Current effect\",\"icon\":\"mdi:palette-outline\",\"stat_t\":\"~/current_effect\"");
+  mqttDiscover("select", "interval",
+               "\"name\":\"Effect change\",\"icon\":\"mdi:timer-sync\",\"cmd_t\":\"~/interval/set\",\"stat_t\":\"~/interval\",\"ops\":" +
+               jsonList(NULL, FX_PERIOD_NAMES, FX_PERIOD_COUNT));
+  mqttDiscover("text", "message",
+               "\"name\":\"Message\",\"icon\":\"mdi:message-text\",\"cmd_t\":\"~/message/set\",\"stat_t\":\"~/message\",\"max\":64");
+  mqttDiscover("number", "message_seconds",
+               "\"name\":\"Message seconds\",\"icon\":\"mdi:timer-outline\",\"cmd_t\":\"~/message_seconds/set\",\"stat_t\":\"~/message_seconds\","
+               "\"min\":3,\"max\":3600,\"step\":1,\"mode\":\"box\",\"unit_of_meas\":\"s\",\"ent_cat\":\"config\"");
+  mqttDiscover("number", "brightness",
+               "\"name\":\"Brightness\",\"icon\":\"mdi:brightness-6\",\"cmd_t\":\"~/brightness/set\",\"stat_t\":\"~/brightness\","
+               "\"min\":1,\"max\":255,\"step\":1,\"mode\":\"slider\"");
+  mqttDiscover("switch", "auto_dimming",
+               "\"name\":\"Auto dimming\",\"icon\":\"mdi:brightness-auto\",\"cmd_t\":\"~/auto_dimming/set\",\"stat_t\":\"~/auto_dimming\"");
+  mqttDiscover("sensor", "temperature",
+               String("\"name\":\"Temperature\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\",\"stat_t\":\"~/temperature\",\"unit_of_meas\":\"") +
+               (tempInF ? "\xC2\xB0" "F" : "\xC2\xB0" "C") + "\"");
+  mqttDiscover("sensor", "wifi_signal",
+               "\"name\":\"Wi-Fi signal\",\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\",\"stat_t\":\"~/wifi_signal\","
+               "\"unit_of_meas\":\"dBm\",\"ent_cat\":\"diagnostic\"");
+  mqttDiscover("sensor", "last_sync",
+               "\"name\":\"Last time sync\",\"dev_cla\":\"timestamp\",\"icon\":\"mdi:clock-check\",\"stat_t\":\"~/last_sync\"");
+  mqttDiscover("sensor", "sync_result",
+               "\"name\":\"Time sync result\",\"icon\":\"mdi:clock-alert-outline\",\"stat_t\":\"~/sync_result\"");
+  mqttDiscover("sensor", "clock_drift",
+               "\"name\":\"Clock drift\",\"icon\":\"mdi:clock-fast\",\"stat_t\":\"~/clock_drift\",\"unit_of_meas\":\"s\",\"stat_cla\":\"measurement\"");
+  mqttDiscover("sensor", "web_address",
+               "\"name\":\"Web address\",\"icon\":\"mdi:web\",\"stat_t\":\"~/web_address\",\"ent_cat\":\"diagnostic\"");
+  mqttDiscover("sensor", "ip_address",
+               "\"name\":\"IP address\",\"icon\":\"mdi:ip-network\",\"stat_t\":\"~/ip_address\",\"ent_cat\":\"diagnostic\"");
+  mqttDiscover("button", "restart",
+               "\"name\":\"Restart\",\"dev_cla\":\"restart\",\"cmd_t\":\"~/restart/set\",\"ent_cat\":\"config\"");
+  mqttDiscover("button", "save",
+               "\"name\":\"Save settings\",\"icon\":\"mdi:content-save\",\"cmd_t\":\"~/save/set\"");
+  mqttDiscover("button", "revert",
+               "\"name\":\"Revert to saved\",\"icon\":\"mdi:restore\",\"cmd_t\":\"~/revert/set\"");
+  mqttDiscover("binary_sensor", "unsaved",
+               "\"name\":\"Unsaved changes\",\"icon\":\"mdi:content-save-alert\",\"stat_t\":\"~/unsaved\"");
+}
+
+// Publish anything that has changed since it was last sent (or everything, when force is true).
+void mqttSendStates(bool force) {
+  if (force || currentStyle != pubStyle || (int)autoStyle != pubAuto) {
+    mqttPublish(mqttBase + "/effect", autoStyle ? "Rotate" : STYLE_NAMES[currentStyle], true);
+    mqttPublish(mqttBase + "/current_effect", STYLE_NAMES[currentStyle], true);
+    pubStyle = currentStyle;
+    pubAuto = autoStyle;
+  }
+  if (force || owner.fxInterval != pubInterval) {
+    mqttPublish(mqttBase + "/interval", FX_PERIOD_NAMES[owner.fxInterval], true);
+    pubInterval = owner.fxInterval;
+  }
+  int bright = constrain(atoi(owner.brightness), 1, 255);
+  if (force || bright != pubBright) {
+    mqttPublish(mqttBase + "/brightness", String(bright), true);
+    pubBright = bright;
+  }
+  if (force || (int)autoDimming != pubDimming) {
+    mqttPublish(mqttBase + "/auto_dimming", autoDimming ? "ON" : "OFF", true);
+    pubDimming = autoDimming;
+  }
+  if (force || owner.msgSeconds != pubMsgSecs) {
+    mqttPublish(mqttBase + "/message_seconds", String(owner.msgSeconds), true);
+    pubMsgSecs = owner.msgSeconds;
+  }
+  if ((force || syncStateDirty) && syncResultText[0]) {
+    mqttPublish(mqttBase + "/sync_result", syncResultText, true);
+    if (lastSyncUtc) {
+      char iso[32];
+      snprintf(iso, sizeof(iso), "%04d-%02d-%02dT%02d:%02d:%02d+00:00", year(lastSyncUtc), month(lastSyncUtc),
+               day(lastSyncUtc), hour(lastSyncUtc), minute(lastSyncUtc), second(lastSyncUtc));
+      mqttPublish(mqttBase + "/last_sync", iso, true);
+      mqttPublish(mqttBase + "/clock_drift", String(lastSyncDrift), true);
+    }
+    syncStateDirty = false;
+  }
+  int unsaved = unsavedChanges();
+  if (force || unsaved != pubUnsaved) {
+    mqttPublish(mqttBase + "/unsaved", unsaved ? "ON" : "OFF", true);
+    pubUnsaved = unsaved;
+  }
+  if (force || msgStateDirty) {
+    mqttPublish(mqttBase + "/message", msgActive ? msgText : "", true);
+    msgStateDirty = false;
+  }
+  if (force) {
+    mqttPublish(mqttBase + "/web_address", clockWebAddress(), true);
+    IPAddress ip = WiFi.localIP();
+    mqttPublish(mqttBase + "/ip_address", String(ip[0]) + "." + ip[1] + "." + ip[2] + "." + ip[3], true);
+  }
+  if (force || millis() - pubStatsAt >= MQTT_STATS_MS) {
+    pubStatsAt = millis();
+    if (rtcOk || usingDs18()) mqttPublish(mqttBase + "/temperature", String(shownTemperature(), 1), true);
+    mqttPublish(mqttBase + "/wifi_signal", String(WiFi.RSSI()), true);
+  }
+}
+
+int findName(const char *name, const char *const *list, int count) {
+  for (int i = 0; i < count; i++)
+    if (!strcasecmp(name, list[i])) return i;
+  return -1;
+}
+
+// A command from Home Assistant.
+void onMqttMessage(int size) {
+  (void)size;                                       // the payload is read until it runs out
+  String topic = mqtt.messageTopic();
+  char val[80];
+  int n = 0;
+  while (mqtt.available()) {
+    int c = mqtt.read();
+    if (n < (int)sizeof(val) - 1) val[n++] = (char)c;
+  }
+  val[n] = 0;
+
+  if (topic == "homeassistant/status") {            // Home Assistant restarted: announce again
+    if (!strcmp(val, "online")) mqttAnnounce = true;
+    return;
+  }
+  if (!topic.startsWith(mqttBase + "/") || !topic.endsWith("/set")) return;
+  String what = topic.substring(mqttBase.length() + 1, topic.length() - 4);
+  Log.print("Home Assistant: ");
+  Log.print(what);
+  Log.print(" = ");
+  Log.println(val);
+
+  if (what == "effect") {
+    if (!strcasecmp(val, "Rotate")) {
+      autoStyle = true;
+      if (rtcOk && timeValid) updateEffect(tzMain.toLocal(rtc.now().unixtime()));
+    } else {
+      int i = findName(val, STYLE_NAMES, NUM_STYLES);
+      if (i >= 0) {
+        autoStyle = false;
+        setStyle(i);
+      }
+    }
+  } else if (what == "interval") {
+    int i = findName(val, FX_PERIOD_NAMES, FX_PERIOD_COUNT);
+    if (i >= 0) {
+      owner.fxInterval = i;
+      if (autoStyle && rtcOk && timeValid) updateEffect(tzMain.toLocal(rtc.now().unixtime()));
+    }
+  } else if (what == "message") {
+    showMessage(val, owner.msgSeconds);
+    msgStateDirty = true;
+  } else if (what == "message_seconds") {
+    owner.msgSeconds = constrain(atoi(val), 3, 3600);
+  } else if (what == "brightness") {
+    snprintf(owner.brightness, sizeof(owner.brightness), "%d", constrain(atoi(val), 1, 255));
+    autoDimming = false;                            // a fixed brightness only makes sense with auto-dimming off
+    setText(owner.dimmer, sizeof(owner.dimmer), "of");
+    applyBrightness();
+  } else if (what == "auto_dimming") {
+    autoDimming = !strcasecmp(val, "ON");
+    setText(owner.dimmer, sizeof(owner.dimmer), autoDimming ? "on" : "of");
+    applyBrightness();
+  } else if (what == "save") {
+    saveSettingsNow();
+  } else if (what == "revert") {
+    revertToSaved();
+  } else if (what == "restart") {
+    mqttPublish(mqttBase + "/status", "offline", true);
+    delay(200);
+    NVIC_SystemReset();
+  }
+  mqttSendStates(false);                            // confirm the new state straight away
+}
+
+bool mqttConnect() {
+  IPAddress ip;
+  if (!ip.fromString(owner.mqttHost) && WiFi.hostByName(owner.mqttHost, ip) != 1) {
+    Log.print("MQTT: can't find the broker ");
+    Log.println(owner.mqttHost);
+    return false;
+  }
+  if (mqttId.length() == 0) {
+    byte mac[6];
+    WiFi.macAddress(mac);                           // WiFiNINA gives the bytes last-first
+    char id[7];
+    snprintf(id, sizeof(id), "%02x%02x%02x", mac[2], mac[1], mac[0]);
+    mqttId = String("rainbowclock_") + id;
+    mqttBase = String("rainbowclock/") + id;
+  }
+  mqtt.setId(mqttId);
+  if (owner.mqttUser[0]) mqtt.setUsernamePassword(owner.mqttUser, owner.mqttPass);
+  mqtt.setKeepAliveInterval(60 * 1000L);
+  mqtt.setConnectionTimeout(5000);
+  String will = mqttBase + "/status";
+  mqtt.beginWill(will, (unsigned short)strlen("offline"), true, 1);   // broker marks us offline if we vanish
+  mqtt.print("offline");
+  mqtt.endWill();
+
+  Log.print("MQTT: connecting to ");
+  Log.print(ip);
+  Log.print(":");
+  Log.println(owner.mqttPort);
+  if (!mqtt.connect(ip, owner.mqttPort)) {
+    int err = mqtt.connectError();
+    Log.print("MQTT: connection failed (");
+    Log.print(err);
+    Log.println(err == 4 || err == 5 ? ": wrong username or password)" : ")");
+    return false;
+  }
+  mqtt.onMessage(onMqttMessage);
+  mqtt.subscribe(mqttBase + "/+/set");
+  mqtt.subscribe("homeassistant/status");
+  mqttPublish(mqttBase + "/status", "online", true);
+  mqttAnnounce = true;
+  Log.println("MQTT: connected - the clock should appear in Home Assistant");
+  return true;
+}
+
+// Called every loop.
+void mqttLoop() {
+  if (!mqttEnabled() || inSetupMode || WiFi.status() != WL_CONNECTED) return;
+  if (!mqtt.connected()) {
+    if (mqttTried && millis() - mqttLastTry < MQTT_RETRY_MS) return;
+    mqttTried = true;
+    mqttLastTry = millis();
+    mqttConnect();
+    return;
+  }
+  mqtt.poll();
+  if (mqttAnnounce) {
+    mqttAnnounce = false;
+    mqttSendDiscovery();
+    mqttSendStates(true);
+  } else {
+    mqttSendStates(false);
+  }
+}
+
+// Setup-page card: the broker to connect to.
+void printMqttCard(WiFiClient &client) {
+  client.println("<li class='a-mqtt'><fieldset class='card'><legend>Home Assistant (MQTT)</legend>");
+  client.print("<p class='hint'>Leave the broker blank to turn this off. Use Home Assistant's IP address (.local names may not work). Status: ");
+  if (!mqttEnabled()) client.print("off");
+  else if (mqtt.connected()) client.print("<b>connected</b>");
+  else client.print("<b>not connected</b> (see the network log)");
+  client.println(".</p>");
+  client.println("<div class='pairs'><div>");
+  client.println("<label for='mqtthost'>Broker (IP address or name)</label>");
+  client.print("<input id='mqtthost' type='text' value='");
+  printAttr(client, owner.mqttHost);
+  client.println("' placeholder='e.g. 192.168.1.20'>");
+  client.println("</div><div class='narrow'>");
+  client.println("<label for='mqttport'>Port</label>");
+  client.print("<input id='mqttport' type='number' min='1' max='65535' value='");
+  client.print(owner.mqttPort);
+  client.println("'>");
+  client.println("</div></div>");
+  client.println("<div class='pairs'><div>");
+  client.println("<label for='mqttuser'>Username</label>");
+  client.print("<input id='mqttuser' type='text' autocomplete='off' value='");
+  printAttr(client, owner.mqttUser);
+  client.println("'>");
+  client.println("</div><div>");
+  client.println("<label for='mqttpass'>Password</label>");
+  client.print("<div class='pwwrap'><input id='mqttpass' type='password' autocomplete='new-password' value='");
+  printAttr(client, owner.mqttPass);
+  client.println("'>");
+  client.println("<button type='button' class='pwbtn' onclick=\"pwToggle('mqttpass', this)\">Show</button></div>");
+  client.println("</div></div>");
+  client.println("</fieldset></li>");
+}
+
+// ================= MDNS: http://rainbowclock.local =================
+// Answers ".local" name lookups on the home network (the same trick Home Assistant uses for
+// homeassistant.local), so the setup page can be opened at http://rainbowclock.local without knowing the IP
+// address. Also advertises the web page as a service, so network browsers list "Rainbow Clock".
+WiFiUDP mdnsUdp;
+MDNS mdns(mdnsUdp);
+bool mdnsRunning = false;
+
+// CLOCK_HOSTNAME in lower case, e.g. "rainbowwallclock" (its .local name without the ".local")
+const char *clockLocalName() {
+  static char name[33] = "";
+  if (!name[0]) {
+    int n = 0;
+    for (const char *c = CLOCK_HOSTNAME; *c && n < (int)sizeof(name) - 1; c++) name[n++] = tolower(*c);
+    name[n] = 0;
+  }
+  return name;
+}
+
+// "http://rainbowwallclock.local"
+String clockWebAddress() {
+  return String("http://") + clockLocalName() + ".local";
+}
+
+void startMdns() {
+  const char *mdnsName = clockLocalName();
+  if (mdns.begin(WiFi.localIP(), mdnsName)) {
+    String service = String(CLOCK_HOSTNAME) + "._http";
+    mdns.addServiceRecord(service.c_str(), 80, MDNSServiceTCP);
+    mdnsRunning = true;
+    Log.print("mDNS: setup page also at http://");
+    Log.print(mdnsName);
+    Log.println(".local");
+  } else {
+    mdnsRunning = false;
+    Log.println("mDNS: couldn't start (the .local name won't work; use the IP address)");
+  }
+}
+
+void restartMdns() {     // after rejoining the Wi-Fi (the IP address may have changed)
+  mdnsUdp.stop();
+  startMdns();
+}
+
+void mdnsLoop() {
+  if (mdnsRunning && !inSetupMode && WiFi.status() == WL_CONNECTED) mdns.run();
+}
+
+// ================= TEMPORARY CHANGES, SAVE AND REVERT =================
+// Changes from Home Assistant (effect, effect change, brightness, auto-dimming, message seconds) only change
+// the clock's memory. "Save settings" writes them to flash; "Revert to saved" goes back to what's in flash.
+// savedSettings is a copy of what's in flash, used to tell whether anything is unsaved.
+Credentials savedSettings;
+
+int currentFixedEffect() {
+  return autoStyle ? -1 : currentStyle;
+}
+
+// Use the saved effect choice: rotate, or hold one effect.
+void applySavedEffect() {
+  if (owner.fxFixed >= 0) {
+    autoStyle = false;
+    setStyle(owner.fxFixed);
+  } else {
+    autoStyle = true;
+    if (rtcOk && timeValid) updateEffect(tzMain.toLocal(rtc.now().unixtime()));
+  }
+}
+
+bool unsavedChanges() {
+  return currentFixedEffect() != savedSettings.fxFixed ||
+         owner.fxInterval != savedSettings.fxInterval ||
+         strcmp(owner.brightness, savedSettings.brightness) != 0 ||
+         strcmp(owner.dimmer, savedSettings.dimmer) != 0 ||
+         owner.msgSeconds != savedSettings.msgSeconds;
+}
+
+void saveSettingsNow() {
+  owner.fxFixed = currentFixedEffect();
+  setText(owner.dimmer, sizeof(owner.dimmer), autoDimming ? "on" : "of");
+  if (!unsavedChanges()) {
+    Log.println("Settings: nothing to save");
+    return;
+  }
+  my_flash_store.write(owner);
+  savedSettings = owner;
+  Log.println("Settings saved to flash");
+}
+
+void revertToSaved() {
+  owner = my_flash_store.read();
+  loadSettings();
+  savedSettings = owner;
+  applySavedEffect();
+  applyBrightness();
+  Log.println("Settings: back to the saved ones");
+}
+
+// ================= BATTERY CHARGER CHIP (BQ24195L) =================
+// The MKR WiFi 1010's charger chip sits on the same I2C bus as the DS3231 (address 0x6B). With no LiPo fitted it
+// keeps hunting for one and blinks the orange CHG LED. Switching charging off (and the chip's watchdog and
+// safety timer, either of which can otherwise turn charging back on or cause the blinking) stops that.
+// It's talked to directly here, so no extra library is needed. Type "pmic" in the Serial Monitor for its status.
+#define PMIC_ADDR 0x6B
+
+int pmicRead(uint8_t reg) {
+  Wire.beginTransmission(PMIC_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return -1;
+  if (Wire.requestFrom(PMIC_ADDR, 1) != 1) return -1;
+  return Wire.read();
+}
+
+bool pmicWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(PMIC_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+// Charging, watchdog and safety timer off; returns true if the chip confirms it.
+bool chargerOff() {
+  int r5 = pmicRead(0x05);                       // REG05: charge termination / timer control
+  int r1 = pmicRead(0x01);                       // REG01: power-on configuration
+  if (r5 < 0 || r1 < 0) {
+    Log.println("Battery charger: chip not answering on I2C");
+    return false;
+  }
+  pmicWrite(0x05, r5 & ~0x38);                   // WATCHDOG bits 5:4 = 00 (off), EN_TIMER bit 3 = 0 (safety timer off)
+  pmicWrite(0x01, r1 & ~0x30 & 0x7F);            // CHG_CONFIG bits 5:4 = 00 (charging off); never set bit 7 (register reset)
+  int c5 = pmicRead(0x05), c1 = pmicRead(0x01);
+  bool ok = c5 >= 0 && c1 >= 0 && (c5 & 0x38) == 0 && (c1 & 0x30) == 0;
+  Log.println(ok ? "Battery charger: off (no battery fitted) - CHG LED should stop flashing"
+                 : "Battery charger: tried to switch it off but the chip didn't take the change");
+  return ok;
+}
+
+// Plain-words status of the charger chip.
+void logChargerStatus() {
+  int r1 = pmicRead(0x01), r5 = pmicRead(0x05), r8 = pmicRead(0x08);
+  pmicRead(0x09);                                // the first read returns faults latched since the last read...
+  int r9 = pmicRead(0x09);                       // ...the second the faults present now
+  if (r1 < 0 || r5 < 0 || r8 < 0 || r9 < 0) {
+    Log.println("Battery charger: chip not answering on I2C");
+    return;
+  }
+  static const char *chg[] = {"not charging", "pre-charging", "fast charging", "charge done"};
+  static const char *vbus[] = {"no input", "USB host", "adapter", "OTG"};
+  static const char *flt[] = {"none", "input fault", "thermal shutdown", "safety timer expired"};
+  Log.print("Battery charger: charging ");
+  Log.print((r1 & 0x30) == 0 ? "OFF" : "ON");
+  Log.print(", watchdog ");
+  Log.print((r5 & 0x30) == 0 ? "off" : "ON");
+  Log.print(", safety timer ");
+  Log.print((r5 & 0x08) ? "ON" : "off");
+  Log.print(" | status: ");
+  Log.print(chg[(r8 >> 4) & 3]);
+  Log.print(", power from ");
+  Log.print(vbus[(r8 >> 6) & 3]);
+  Log.print((r8 & 0x04) ? ", power good" : ", power NOT good");
+  Log.print(" | faults: charge ");
+  Log.print(flt[(r9 >> 4) & 3]);
+  if (r9 & 0x80) Log.print(", watchdog expired");
+  if (r9 & 0x08) Log.print(", battery over-voltage");
+  if (r9 & 0x07) { Log.print(", temperature sensor fault "); Log.print(r9 & 0x07); }
+  Log.print(" (raw REG01=0x"); Log.print(r1, HEX);
+  Log.print(" REG05=0x"); Log.print(r5, HEX);
+  Log.print(" REG08=0x"); Log.print(r8, HEX);
+  Log.print(" REG09=0x"); Log.print(r9, HEX);
+  Log.println(")");
+}
+
+// Once a minute: if charging has been switched back on (e.g. the chip reset itself), switch it off again.
+void checkChargerStillOff() {
+#if DISABLE_BATTERY_CHARGER
+  int r1 = pmicRead(0x01);
+  if (r1 >= 0 && (r1 & 0x30) != 0) {
+    Log.println("Battery charger: charging had come back on - switching it off again");
+    chargerOff();
+    logChargerStatus();
+  }
+#endif
+}
+
+// ================= RESET-SETTINGS BUTTON =================
+// Hold the button on RESET_BUTTON_PIN for RESET_HOLD_MS (3 s): the saved Wi-Fi network and password are
+// cleared and the clock restarts into its "RainbowClockSetup" network. Timezones, effects and the other
+// settings are kept. While it's held, the date display shows "CLR" and the day display counts down; let go
+// before the end and nothing changes. A button that already reads pressed at start-up is ignored until it has
+// been released once, so a stuck button or wiring fault can never cause a clear-and-restart loop.
+void checkResetButton() {
+  static unsigned long pressedAt = 0;
+  static int shownLeft = -1;
+  static bool armed = false;      // only true once the button has been seen released since start-up
+  static bool warned = false;
+  if (!armed) {
+    if (digitalRead(RESET_BUTTON_PIN) == HIGH) {
+      armed = true;
+      if (warned) Log.println("Reset button: released, now working normally");
+    } else if (!warned) {
+      warned = true;
+      Log.print("Reset button: pin ");
+      Log.print(RESET_BUTTON_PIN);
+      Log.println(" reads PRESSED at start-up - ignoring it until it's released (check the button wiring)");
+    }
+    return;
+  }
+  if (digitalRead(RESET_BUTTON_PIN) == HIGH) {          // not pressed (the pin's pull-up holds it high)
+    if (shownLeft >= 0) {                               // let go early: put the normal displays back
+      Log.println("Reset button released - nothing changed");
+      panels[DAY_PANEL].manual = false;
+      panels[DATE_PANEL].manual = false;
+      writePanelText(panels[DAY_PANEL], "");
+      writePanelText(panels[DATE_PANEL], "");
+      if (inSetupMode) {
+        setPanelText(DATE_PANEL, "SET");   // date display reads first
+        setPanelText(DAY_PANEL, "UP");
+      }
+      drawClock();                                      // puts the date and day back (if the time is known)
+    }
+    pressedAt = 0;
+    shownLeft = -1;
+    return;
+  }
+  if (pressedAt == 0) {
+    pressedAt = millis();
+    return;
+  }
+  unsigned long held = millis() - pressedAt;
+  if (held < 300) return;                               // ignore bounces and accidental taps
+
+  int left = (RESET_HOLD_MS - min(held, (unsigned long)RESET_HOLD_MS) + 999) / 1000;   // whole seconds left
+  if (left != shownLeft) {
+    if (shownLeft < 0) Log.println("Reset button held: keep holding to clear the Wi-Fi settings");
+    shownLeft = left;
+    char buf[6];
+    snprintf(buf, sizeof(buf), " %d", left);
+    panels[DAY_PANEL].manual = true;
+    panels[DATE_PANEL].manual = true;
+    writePanelText(panels[DATE_PANEL], "CLR");          // reads "CLR 3", "CLR 2", ...
+    writePanelText(panels[DAY_PANEL], buf);
+  }
+  if (held < RESET_HOLD_MS) return;
+
+  Log.println("Clearing the saved Wi-Fi settings and restarting into the setup network");
+  owner.valid = false;
+  memset(owner.wifissid, 0, sizeof(owner.wifissid));
+  memset(owner.Password, 0, sizeof(owner.Password));
+  my_flash_store.write(owner);
+  writePanelText(panels[DATE_PANEL], "WIFI");         // reads "WIFI CLR"
+  writePanelText(panels[DAY_PANEL], "CLR");
+  unsigned long t = millis();
+  while (millis() - t < 1500) clockUpdate();            // show it for a moment
+  NVIC_SystemReset();
+}
+
+// ================= SETUP / LOOP =================
+// Why the board last restarted (SAMD21 reset-cause register), printed at start-up to help diagnose problems.
+const char *resetCause() {
+  uint8_t r = PM->RCAUSE.reg;
+  if (r & PM_RCAUSE_SYST) return "software restart (e.g. after saving settings)";
+  if (r & PM_RCAUSE_WDT)  return "watchdog";
+  if (r & PM_RCAUSE_EXT)  return "reset pin (button, or something pulling RESET low)";
+  if (r & PM_RCAUSE_BOD33 || r & PM_RCAUSE_BOD12) return "power dipped too low (brown-out)";
+  if (r & PM_RCAUSE_POR)  return "power on";
+  return "unknown";
+}
+
+void setup() {
+  pinMode(RESET_WIRE_PIN, INPUT);   // high-impedance: the pin is wired to RESET, so it must never be driven
+  pinMode(RESET_BUTTON_PIN, INPUT);          // reset-settings button pulls this to GND when pressed;
+  digitalWrite(RESET_BUTTON_PIN, HIGH);      // on an input, HIGH turns the pull-up on (same as INPUT_PULLUP)
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);           // built-in LED on while starting up
+  Serial.begin(115200);
+  unsigned long waitStart = millis();
+  while (!Serial && millis() - waitStart < 2000);   // give the Serial Monitor a moment to connect
+  Log.println();
+  Log.println("==== Rainbow Clock starting ====");
+  Log.print("Name: ");
+  Log.print(CLOCK_HOSTNAME);
+  Log.print(" (setup page: ");
+  Log.print(clockWebAddress());
+  Log.println(" once on the Wi-Fi)");
+  Log.print("Last restart: ");
+  Log.println(resetCause());
+  Log.print("Reset button (pin ");
+  Log.print(RESET_BUTTON_PIN);
+  Log.println(digitalRead(RESET_BUTTON_PIN) == HIGH ? "): not pressed" : "): reads PRESSED");
+  buildSinTable();
+  Log.println("Starting LED displays...");
+  setupAllPanels();
+  Log.println("LED displays ok");
+  randomSeed(analogRead(pResistor));
+
+  owner = my_flash_store.read();
+  loadSettings();
+  savedSettings = owner;
+  setStyle(0);
+  if (owner.fxFixed >= 0) {          // saved as "hold one effect"
+    autoStyle = false;
+    setStyle(owner.fxFixed);
+  }
+
+  rtcOk = rtc.begin();
+  Log.println(rtcOk ? "RTC (DS3231) found" : "RTC (DS3231) not found");
+  Wire.begin();
+#if DISABLE_BATTERY_CHARGER
+  chargerOff();
+#endif
+  logChargerStatus();
+  setupDs18();
+  if (rtcOk) {
+    timeValid = !rtc.lostPower();   // the RTC kept time on its battery
+    Log.print("RTC at start-up: ");
+    logDateTime(rtc.now().unixtime());
+    Log.println(timeValid ? " UTC" : " UTC - but it lost power, so this isn't trusted until the time server answers");
+    setupRtcAlarms();
+  }
+
+  Log.println("Checking Wi-Fi module...");
+  if (WiFi.status() == WL_NO_MODULE) {
+    debugoutput(1, 0, 0, 0, 255, 0, 0);       // top row red: no Wi-Fi module
+    Log.println("Communication with WiFi module failed!");
+    while (true);
+  }
+  String fv = WiFi.firmwareVersion();
+  Log.print("Wi-Fi module firmware ");
+  Log.println(fv);
+  if (fv < WIFI_FIRMWARE_LATEST_VERSION) Log.println("Please upgrade the WiFi firmware");
+
+  int ntpResult = 2;
+  if (!owner.valid) {
+    Log.println("No saved Wi-Fi settings: starting the setup network");
+    startSetupAP();
+  } else {
+    debugoutput(0, 1, 0, 0, 0, 150, 0);       // middle row green: connecting with saved details
+    Log.print("Stored SSID: ");
+    Log.println(owner.wifissid);
+    String returnedip = validateSSID(owner);
+    if (returnedip == "0.0.0.0") {
+      debugoutput(1, 1, 1, 0, 255, 0, 0);     // all rows red: couldn't join the saved Wi-Fi
+      Log.println("Wifi Failed");
+      delay(3000);
+      startSetupAP();
+      if (rtcOk) nextWifiTry = rtc.now().unixtime() + WIFI_RETRY_MINUTES * 60UL;   // try the saved Wi-Fi again later
+    } else {
+      debugoutput(0, 0, 1, 1, 0, 150, 0);     // bottom row + colon green: joined the Wi-Fi
+      WiFi.noLowPowerMode();                  // keep the radio awake so it answers promptly
+      server.begin();
+      startNetLog();
+      startMdns();
+      printWiFiStatus();
+      if (rtcOk) {
+        ntpResult = syncTimeFromNTP();
+        if (ntpResult == 1) { debugoutput(1, 1, 1, 0, 150, 150, 150); delay(3000); }   // grey: DNS failed
+        if (ntpResult == 2) { debugoutput(1, 1, 1, 0, 255, 75, 250);  delay(3000); }   // pink: no reply
+      }
+    }
+  }
+  if (rtcOk && ntpResult != 0) ntpRetryAt = rtc.now().unixtime() + 3600UL;   // boot sync failed: retry hourly
+
+  if (!timeValid) {   // no believable time yet: dashes until the time server answers
+    writePanelText(panels[TIME_A_PANEL], "----");
+    writePanelText(panels[TIME_B_PANEL], "----");
+  }
+  drawClock();        // show the time now rather than waiting for the next minute alarm
+  if (!inSetupMode) digitalWrite(LED_BUILTIN, LOW);   // started normally: built-in LED off
+  Log.println("Clock ready - type help in the Serial Monitor for test commands");
+}
+
+void loop() {
+  handleRtcAlarms();    // DS3231 alarms: :00 time / date / effect, :55 temperature
+  checkMissedAlarms();  // safety net if an alarm doesn't arrive (logs a warning)
+  updateBrightness();   // light sensor or fixed brightness
+  clockUpdate();        // Serial Monitor commands + draw all displays at FPS
+  handleWebClient();    // setup page
+  checkResetButton();   // hold 3 s to clear the saved Wi-Fi details
+  updateMessage();      // scroll / end a message on the date and day displays
+  mqttLoop();           // Home Assistant
+  mdnsLoop();           // answer rainbowclock.local lookups
+}
